@@ -396,4 +396,3 @@ isolated and concurrent resets, channel changes, uninstall deletion, rapid
 concurrent writes, configured-channel privacy filtering, runtime deduplication,
 Discord permission failures, gateway-intent scope, individual deletion, and
 reset authorization.
-

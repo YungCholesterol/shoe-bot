@@ -1,0 +1,2 @@
+"""Shoe Bot tests."""
+
