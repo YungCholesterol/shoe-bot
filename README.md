@@ -1,4 +1,4 @@
-<img src="https://upload.wikimedia.org/wikipedia/commons/8/8d/President_Barack_Obama.jpg" alt="Shoe Bot profile picture" width="132" align="right">
+<img src="https://upload.wikimedia.org/wikipedia/commons/8/8d/President_Barack_Obama.jpg" alt="Shoe Bot profile picture" width="96" align="right">
 
 # Shoe Bot
 
