@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .database import DatabaseError, GuildStats, ShoeDatabase
+from .database import (
+    DatabaseError,
+    GuildStats,
+    HallOfFameEntry,
+    LeaderboardEntry,
+    ShoeDatabase,
+)
 from .shoe_game import FOOTWEAR_EMOJIS, ShoeGame
 
 
@@ -69,6 +75,34 @@ def _disable_view(view: discord.ui.View) -> None:
             item.disabled = True  # type: ignore[attr-defined]
 
 
+async def _replace_with_terminal_view(
+    interaction: discord.Interaction,
+    *,
+    text: str,
+    view: discord.ui.View,
+) -> None:
+    """Acknowledge a failed component and leave no enabled-looking controls."""
+    try:
+        if interaction.response.is_done():
+            await interaction.edit_original_response(
+                content=text,
+                embed=None,
+                view=view,
+            )
+        else:
+            await interaction.response.edit_message(
+                content=text,
+                embed=None,
+                view=view,
+            )
+    except discord.HTTPException as exc:
+        LOGGER.warning(
+            "Could not replace a failed component panel (%s)",
+            type(exc).__name__,
+        )
+        await _private_error(interaction, text)
+
+
 def _missing_permissions(
     guild: discord.Guild,
     channel: discord.abc.GuildChannel,
@@ -86,6 +120,183 @@ def _missing_permissions(
 
 def _next_achievement(count: int) -> int | None:
     return next((value for value in ACHIEVEMENT_THRESHOLDS if value > count), None)
+
+
+def _rules_text(stats: GuildStats | None) -> tuple[str, str]:
+    matching_mode = stats.matching_mode if stats is not None else "creative"
+    gameplay_mode = stats.gameplay_mode if stats is not None else "relay"
+    matching = (
+        "Creative matching accepts `shoe` anywhere, fixed creative spellings "
+        "such as `s-h-o-e`, `sh0e`, styled Unicode text, footwear or skate "
+        "emoji (`👞 👟 👠 👡 👢 🥾 🥿 🩰 🩴 ⛸️ 🛼`), and shoe-named custom "
+        "emoji or stickers. Attachments and reactions are not analyzed."
+        if matching_mode == "creative"
+        else "Classic matching accepts messages containing `shoe`, case-insensitively."
+    )
+    gameplay = (
+        "Relay gameplay requires different users on consecutive accepted "
+        "messages. Repeating twice in a row breaks the streak."
+        if gameplay_mode == "relay"
+        else "Standard gameplay allows consecutive accepted messages from the same user."
+    )
+    return matching, gameplay
+
+
+def _contributors_embed(entries: Sequence[LeaderboardEntry]) -> discord.Embed:
+    embed = discord.Embed(
+        title="Shoe leaderboard",
+        description="Top 10 by accepted messages",
+        colour=EMBED_COLOUR,
+    )
+    if entries:
+        embed.add_field(
+            name="Rankings",
+            value="\n".join(
+                f"`{entry.rank:>2}`  <@{entry.user_id}>  **{entry.shoe_count:,}**"
+                for entry in entries
+            ),
+            inline=False,
+        )
+    else:
+        embed.description = "No accepted messages yet."
+    embed.set_footer(text="Use /profile user:@user to check a user's full profile.")
+    return embed
+
+
+def _hall_of_fame_embed(
+    stats: GuildStats,
+    entries: Sequence[HallOfFameEntry],
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="Shoe Hall of Fame",
+        description=(
+            f"Current streak: **{stats.current_streak:,}**\n"
+            f"Best streak: **{stats.best_streak:,}**"
+        ),
+        colour=EMBED_COLOUR,
+    )
+    if entries:
+        lines = []
+        for entry in entries:
+            date = (
+                "recorded before Hall of Fame"
+                if entry.completed_at is None or entry.is_legacy
+                else f"completed <t:{entry.completed_at}:d>"
+            )
+            lines.append(
+                f"`{entry.rank:>2}`  **{entry.streak_length:,}** messages · {date}"
+            )
+        embed.add_field(name="Completed streaks", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(
+            name="Completed streaks",
+            value="No completed streaks have been recorded yet.",
+            inline=False,
+        )
+    return embed
+
+
+class LeaderboardView(discord.ui.View):
+    """Requester-bound switcher between contributors and completed streaks."""
+
+    def __init__(
+        self,
+        *,
+        requester_id: int,
+        guild_id: int,
+        contributors: discord.Embed,
+        hall_of_fame: discord.Embed,
+    ) -> None:
+        super().__init__(timeout=120.0)
+        self._requester_id = requester_id
+        self._guild_id = guild_id
+        self._contributors_embed = contributors
+        self._hall_of_fame_embed = hall_of_fame
+        self._callback_lock = asyncio.Lock()
+        self._message: discord.InteractionMessage | None = None
+        self.contributors.disabled = True
+
+    def bind_message(self, message: discord.InteractionMessage) -> None:
+        self._message = message
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        valid = bool(
+            interaction.user.id == self._requester_id
+            and interaction.guild_id == self._guild_id
+            and not self.is_finished()
+        )
+        if not valid:
+            await _private_error(
+                interaction,
+                "Run `/leaderboard` yourself to use these controls.",
+            )
+        return valid
+
+    async def _show(
+        self,
+        interaction: discord.Interaction,
+        *,
+        hall_of_fame: bool,
+    ) -> None:
+        await interaction.response.defer()
+        async with self._callback_lock:
+            if self.is_finished():
+                await _private_error(interaction, "This leaderboard has expired.")
+                return
+            self.contributors.disabled = not hall_of_fame
+            self.hall_of_fame.disabled = hall_of_fame
+            embed = (
+                self._hall_of_fame_embed
+                if hall_of_fame
+                else self._contributors_embed
+            )
+            await interaction.edit_original_response(embed=embed, view=self)
+
+    @discord.ui.button(label="Contributors", style=discord.ButtonStyle.secondary)
+    async def contributors(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self._show(interaction, hall_of_fame=False)
+
+    @discord.ui.button(label="Hall of Fame", style=discord.ButtonStyle.secondary)
+    async def hall_of_fame(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self._show(interaction, hall_of_fame=True)
+
+    async def on_timeout(self) -> None:
+        async with self._callback_lock:
+            _disable_view(self)
+            self.stop()
+            if self._message is None:
+                return
+            try:
+                await self._message.edit(view=self)
+            except discord.HTTPException as exc:
+                LOGGER.warning(
+                    "Could not disable an expired leaderboard (%s)",
+                    type(exc).__name__,
+                )
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        _item: discord.ui.Item,
+    ) -> None:
+        LOGGER.error("Leaderboard interaction failed (%s)", type(error).__name__)
+        async with self._callback_lock:
+            _disable_view(self)
+            self.stop()
+        await _replace_with_terminal_view(
+            interaction,
+            text="The leaderboard panel could not be updated. Run `/leaderboard` again.",
+            view=self,
+        )
 
 
 def _settings_embed(
@@ -132,6 +343,14 @@ def _settings_embed(
     embed.add_field(name="Matching", value=matching_text, inline=False)
     embed.add_field(name="Gameplay", value=gameplay_text, inline=False)
     embed.add_field(name="Permission check", value=permission_text, inline=False)
+    embed.add_field(
+        name="Portal check",
+        value=(
+            "Message Content Intent must be enabled in the Discord Developer "
+            "Portal. Shoe Bot cannot inspect that portal setting."
+        ),
+        inline=False,
+    )
     return embed
 
 
@@ -150,6 +369,7 @@ class SetupWizardView(discord.ui.View):
         is_current: Callable[[], bool],
         finished: Callable[[], None],
         title: str,
+        start_reset: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(timeout=180.0)
         self._game = game
@@ -162,6 +382,7 @@ class SetupWizardView(discord.ui.View):
         self._is_current = is_current
         self._finished = finished
         self._title = title
+        self._start_reset = start_reset
         self._consumed = False
         self._saved = False
         self._callback_lock = asyncio.Lock()
@@ -171,6 +392,8 @@ class SetupWizardView(discord.ui.View):
             option.default = option.value == initial_matching_mode
         for option in self.gameplay_select.options:
             option.default = option.value == initial_gameplay_mode
+        if start_reset is None:
+            self.remove_item(self.reset_data)
 
     def bind_message(self, message: discord.InteractionMessage) -> None:
         self._message = message
@@ -311,7 +534,7 @@ class SetupWizardView(discord.ui.View):
                 view=self,
             )
 
-    @discord.ui.button(label="Recheck permissions", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Run diagnostic", style=discord.ButtonStyle.secondary, row=3)
     async def recheck(
         self,
         interaction: discord.Interaction,
@@ -354,7 +577,7 @@ class SetupWizardView(discord.ui.View):
                     interaction,
                     "I still need these permissions in that channel: "
                     + ", ".join(missing)
-                    + ". Fix them, then select Recheck permissions.",
+                    + ". Fix them, then select Run diagnostic.",
                 )
                 return
             if not self._consume():
@@ -386,6 +609,11 @@ class SetupWizardView(discord.ui.View):
                     LOGGER.warning(
                         "Could not report a settings failure (%s)",
                         type(response_exc).__name__,
+                    )
+                    await _private_error(
+                        interaction,
+                        "I could not verify that the settings were saved. "
+                        "Open `/shoesettings` and check the current values.",
                     )
                 return
             finally:
@@ -444,6 +672,31 @@ class SetupWizardView(discord.ui.View):
             except discord.HTTPException as exc:
                 LOGGER.warning("Could not confirm settings cancellation (%s)", type(exc).__name__)
 
+    @discord.ui.button(
+        label="Reset server data",
+        style=discord.ButtonStyle.danger,
+        row=4,
+    )
+    async def reset_data(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer()
+        async with self._callback_lock:
+            if self._consumed or not self._is_current():
+                await _private_error(interaction, "These settings are no longer valid.")
+                return
+            if self._start_reset is None:
+                await _private_error(interaction, "Reset is not available during setup.")
+                return
+            if not self._consume():
+                await _private_error(interaction, "These settings have already been used.")
+                return
+            _disable_view(self)
+            self.stop()
+            await self._start_reset(interaction)
+
     async def on_timeout(self) -> None:
         async with self._callback_lock:
             if self._consumed:
@@ -479,7 +732,7 @@ class SetupWizardView(discord.ui.View):
             if self._saved
             else "The settings action failed. Open `/shoesettings` and verify the current values."
         )
-        await _private_error(interaction, text)
+        await _replace_with_terminal_view(interaction, text=text, view=self)
 
 
 class ResetConfirmationView(discord.ui.View):
@@ -523,7 +776,7 @@ class ResetConfirmationView(discord.ui.View):
         if not valid:
             await _private_error(
                 interaction,
-                "This reset is no longer valid. Run `/reset` again as an administrator.",
+                "This reset is no longer valid. Open `/shoesettings` again as an administrator.",
             )
         return valid
 
@@ -556,7 +809,7 @@ class ResetConfirmationView(discord.ui.View):
                     await interaction.edit_original_response(
                         content=(
                             "I could not verify that the reset completed. "
-                            "Check `/stats` before trying again."
+                            "Check `/streak` before trying again."
                         ),
                         view=self,
                     )
@@ -564,6 +817,11 @@ class ResetConfirmationView(discord.ui.View):
                     LOGGER.warning(
                         "Could not report a reset failure (%s)",
                         type(response_exc).__name__,
+                    )
+                    await _private_error(
+                        interaction,
+                        "I could not verify that the reset completed. "
+                        "Check `/streak` before trying again.",
                     )
                 return
             finally:
@@ -588,7 +846,7 @@ class ResetConfirmationView(discord.ui.View):
                 try:
                     await interaction.followup.send(
                         "The reset completed, but I could not update the panel. "
-                        "Run `/stats` to verify it.",
+                        "Run `/streak` to verify it.",
                         ephemeral=True,
                     )
                 except discord.HTTPException as followup_exc:
@@ -648,11 +906,11 @@ class ResetConfirmationView(discord.ui.View):
             _disable_view(self)
             self.stop()
         text = (
-            "The reset completed, but the panel failed to update. Run `/stats` to verify it."
+            "The reset completed, but the panel failed to update. Run `/streak` to verify it."
             if self._reset_completed
-            else "The reset action failed. Check `/stats` before trying again."
+            else "The reset action failed. Check `/streak` before trying again."
         )
-        await _private_error(interaction, text)
+        await _replace_with_terminal_view(interaction, text=text, view=self)
 
 
 class ShoeCommands(commands.Cog):
@@ -692,6 +950,7 @@ class ShoeCommands(commands.Cog):
         *,
         stats: GuildStats | None,
         title: str,
+        start_reset: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
         if interaction.guild is None or interaction.guild_id is None:
             await _private_error(interaction, "This command can only be used in a server.")
@@ -719,11 +978,53 @@ class ShoeCommands(commands.Cog):
                 is_current=is_current,
                 finished=finished,
                 title=title,
+                start_reset=start_reset,
             )
             message = await interaction.edit_original_response(
                 embed=view.build_embed(),
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            view.bind_message(message)
+        except BaseException:
+            finished()
+            if "view" in locals():
+                view.stop()
+            raise
+
+    async def _open_reset_confirmation(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild_id is None:
+            return
+        token = object()
+        guild_id = interaction.guild_id
+        self._pending_reset_tokens[guild_id] = token
+
+        def is_current() -> bool:
+            return self._pending_reset_tokens.get(guild_id) is token
+
+        def finished() -> None:
+            if is_current():
+                self._pending_reset_tokens.pop(guild_id, None)
+
+        try:
+            view = ResetConfirmationView(
+                self._game,
+                guild_id,
+                interaction.user.id,
+                is_current,
+                finished,
+            )
+            message = await interaction.edit_original_response(
+                content=(
+                    "Reset this server's total count, current and best streaks, "
+                    "personal counts, Hall of Fame records, and Relay state? The "
+                    "configured channel and game modes will remain. This cannot be undone."
+                ),
+                embed=None,
+                view=view,
             )
             view.bind_message(message)
         except BaseException:
@@ -752,7 +1053,8 @@ class ShoeCommands(commands.Cog):
         await self._open_settings(interaction, stats=stats, title="Shoe Bot setup")
 
     @app_commands.command(
-        name="shoesettings", description="Change Shoe Bot's channel or game modes"
+        name="shoesettings",
+        description="Manage Shoe Bot settings, diagnostics, or server reset",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
@@ -761,70 +1063,39 @@ class ShoeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         stats = await self._guild_stats_or_error(interaction)
         if stats is not None:
-            await self._open_settings(interaction, stats=stats, title="Shoe Bot settings")
+            await self._open_settings(
+                interaction,
+                stats=stats,
+                title="Shoe Bot settings",
+                start_reset=self._open_reset_confirmation,
+            )
 
-    @app_commands.command(name="stats", description="Show server or user Shoe statistics")
-    @app_commands.describe(user="Optionally show one user's accepted Shoe total and rank")
+    @app_commands.command(name="streak", description="Show this server's Shoe streak")
     @app_commands.guild_only()
-    async def stats(
-        self,
-        interaction: discord.Interaction,
-        user: discord.User | None = None,
-    ) -> None:
+    async def streak(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
         stats = await self._guild_stats_or_error(interaction)
-        if stats is None:
-            return
-        if user is None:
-            embed = discord.Embed(title="Shoe statistics", colour=EMBED_COLOUR)
-            embed.add_field(name="Total", value=f"{stats.total_shoes:,}")
+        if stats is not None:
+            embed = discord.Embed(title="Shoe streak", colour=EMBED_COLOUR)
             embed.add_field(name="Current streak", value=f"{stats.current_streak:,}")
             embed.add_field(name="Best streak", value=f"{stats.best_streak:,}")
+            embed.add_field(name="Total accepted", value=f"{stats.total_shoes:,}")
             embed.set_footer(
                 text=f"{stats.matching_mode.title()} matching · {stats.gameplay_mode.title()} gameplay"
             )
             await _respond(interaction, embed=embed)
-            return
 
-        try:
-            user_stats = await self._database.run(
-                self._database.get_user_stats,
-                interaction.guild_id,
-                user.id,
-            )
-        except DatabaseError as exc:
-            LOGGER.error("Could not read user statistics (%s)", type(exc).__name__)
-            await _private_error(interaction, "That user's statistics are unavailable.")
-            return
-        rank = f"#{user_stats.rank:,}" if user_stats.rank is not None else "Unranked"
-        next_value = _next_achievement(user_stats.shoe_count)
-        progress = (
-            f"{user_stats.shoe_count:,} / {next_value:,}"
-            if next_value is not None
-            else "All milestones unlocked"
-        )
-        embed = discord.Embed(
-            title="Personal Shoe statistics",
-            description=user.mention,
-            colour=EMBED_COLOUR,
-        )
-        embed.add_field(name="Accepted messages", value=f"{user_stats.shoe_count:,}")
-        embed.add_field(name="Leaderboard rank", value=rank)
-        embed.add_field(name="Next achievement", value=progress, inline=False)
-        await _respond(
-            interaction,
-            embed=embed, allowed_mentions=discord.AllowedMentions.none()
-        )
-
-    @app_commands.command(name="leaderboard", description="Show the top 10 Shoe players")
+    @app_commands.command(
+        name="leaderboard", description="Show Shoe rankings and Hall of Fame"
+    )
     @app_commands.guild_only()
     async def leaderboard(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
-        if await self._guild_stats_or_error(interaction) is None:
+        if interaction.guild_id is None:
             return
         try:
-            entries = await self._database.run(
-                self._database.get_leaderboard,
+            snapshot = await self._database.run(
+                self._database.get_leaderboard_snapshot,
                 interaction.guild_id,
                 limit=10,
             )
@@ -832,91 +1103,41 @@ class ShoeCommands(commands.Cog):
             LOGGER.error("Could not read leaderboard (%s)", type(exc).__name__)
             await _private_error(interaction, "The leaderboard is temporarily unavailable.")
             return
-
-        embed = discord.Embed(
-            title="Shoe leaderboard",
-            description="Top 10 by accepted messages",
-            colour=EMBED_COLOUR,
-        )
-        if entries:
-            embed.add_field(
-                name="Rankings",
-                value="\n".join(
-                    f"`{entry.rank:>2}`  <@{entry.user_id}>  **{entry.shoe_count:,}**"
-                    for entry in entries
-                ),
-                inline=False,
-            )
-        else:
-            embed.description = "No accepted messages yet."
-        embed.set_footer(text="Use /stats user:@user to check any user's rank.")
-        await _respond(
-            interaction,
-            embed=embed, allowed_mentions=discord.AllowedMentions.none()
-        )
-
-    @app_commands.command(name="count", description="Show the server's total Shoe count")
-    @app_commands.guild_only()
-    async def count(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=True)
-        stats = await self._guild_stats_or_error(interaction)
-        if stats is not None:
-            await _respond(
+        if snapshot is None:
+            await _private_error(
                 interaction,
-                f"Total accepted Shoe messages: **{stats.total_shoes:,}**"
+                "Shoe Bot is not configured here. Create a dedicated text channel "
+                "such as `#shoe`, then have an administrator run `/setup`.",
             )
+            return
 
-    @app_commands.command(name="records", description="Show the server's Hall of Fame")
-    @app_commands.guild_only()
-    async def records(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(thinking=True)
-        stats = await self._guild_stats_or_error(interaction)
-        if stats is None:
-            return
-        try:
-            entries = await self._database.run(
-                self._database.get_hall_of_fame,
-                interaction.guild_id,
-                limit=10,
-            )
-        except DatabaseError as exc:
-            LOGGER.error("Could not read Hall of Fame (%s)", type(exc).__name__)
-            await _private_error(interaction, "The Hall of Fame is temporarily unavailable.")
-            return
-        embed = discord.Embed(
-            title="Shoe Hall of Fame",
-            description=(
-                f"Current streak: **{stats.current_streak:,}**\n"
-                f"Best streak: **{stats.best_streak:,}**"
+        contributors_embed = _contributors_embed(snapshot.contributors)
+        view = LeaderboardView(
+            requester_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            contributors=contributors_embed,
+            hall_of_fame=_hall_of_fame_embed(
+                snapshot.stats,
+                snapshot.hall_of_fame,
             ),
-            colour=EMBED_COLOUR,
         )
-        if entries:
-            lines = []
-            for entry in entries:
-                date = (
-                    "recorded before Hall of Fame"
-                    if entry.completed_at is None or entry.is_legacy
-                    else f"completed <t:{entry.completed_at}:d>"
-                )
-                lines.append(
-                    f"`{entry.rank:>2}`  **{entry.streak_length:,}** messages · {date}"
-                )
-            embed.add_field(name="Completed streaks", value="\n".join(lines), inline=False)
-        else:
-            embed.add_field(
-                name="Completed streaks",
-                value="No completed streaks have been recorded yet.",
-                inline=False,
+        try:
+            message = await interaction.edit_original_response(
+                embed=contributors_embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
-        await _respond(interaction, embed=embed)
+            view.bind_message(message)
+        except BaseException:
+            view.stop()
+            raise
 
     @app_commands.command(
-        name="achievements", description="Show Shoe milestones for a user"
+        name="profile", description="Show a user's Shoe count, rank, and milestones"
     )
-    @app_commands.describe(user="Optionally show another user's milestones")
+    @app_commands.describe(user="Optionally show another user's Shoe profile")
     @app_commands.guild_only()
-    async def achievements(
+    async def profile(
         self,
         interaction: discord.Interaction,
         user: discord.User | None = None,
@@ -932,50 +1153,76 @@ class ShoeCommands(commands.Cog):
                 target.id,
             )
         except DatabaseError as exc:
-            LOGGER.error("Could not read achievements (%s)", type(exc).__name__)
-            await _private_error(interaction, "Achievements are temporarily unavailable.")
+            LOGGER.error("Could not read a Shoe profile (%s)", type(exc).__name__)
+            await _private_error(interaction, "That Shoe profile is temporarily unavailable.")
             return
+        rank = f"#{user_stats.rank:,}" if user_stats.rank is not None else "Unranked"
+        next_value = _next_achievement(user_stats.shoe_count)
+        progress = (
+            f"{user_stats.shoe_count:,} / {next_value:,}"
+            if next_value is not None
+            else "All milestones unlocked"
+        )
         lines = [
             f"{'Unlocked' if user_stats.shoe_count >= threshold else 'Locked'} · {threshold:,} accepted messages"
             for threshold in ACHIEVEMENT_THRESHOLDS
         ]
         embed = discord.Embed(
-            title="Shoe achievements",
-            description=f"{target.mention}\n{user_stats.shoe_count:,} accepted messages",
+            title="Shoe profile",
+            description=target.mention,
             colour=EMBED_COLOUR,
         )
+        embed.add_field(name="Accepted messages", value=f"{user_stats.shoe_count:,}")
+        embed.add_field(name="Leaderboard rank", value=rank)
+        embed.add_field(name="Next milestone", value=progress, inline=False)
         embed.add_field(name="Milestones", value="\n".join(lines), inline=False)
-        embed.set_footer(text="Achievements are derived from the stored personal count.")
+        embed.set_footer(text="Milestones are derived from the stored personal count.")
         await _respond(
             interaction,
             embed=embed, allowed_mentions=discord.AllowedMentions.none()
         )
 
-    @app_commands.command(name="shoerules", description="Show this server's Shoe rules")
+    @app_commands.command(
+        name="shoehelp", description="Show Shoe Bot commands, rules, and support"
+    )
     @app_commands.guild_only()
-    async def shoerules(self, interaction: discord.Interaction) -> None:
+    async def shoehelp(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
-        stats = await self._guild_stats_or_error(interaction)
-        if stats is None:
+        try:
+            stats = await self._database.run(
+                self._database.get_guild_stats,
+                interaction.guild_id,
+            )
+        except DatabaseError as exc:
+            LOGGER.error("Could not read rules for help (%s)", type(exc).__name__)
+            await _private_error(interaction, "Shoe Bot help is temporarily unavailable.")
             return
-        matching = (
-            "Creative matching accepts `shoe` anywhere, fixed creative spellings "
-            "such as `s-h-o-e`, `sh0e`, styled Unicode text, footwear or skate "
-            "emoji (`👞 👟 👠 👡 👢 🥾 🥿 🩰 🩴 ⛸️ 🛼`), and shoe-named custom "
-            "emoji or stickers. Attachments and reactions are not analyzed."
-            if stats.matching_mode == "creative"
-            else "Classic matching accepts messages containing `shoe`, case-insensitively."
-        )
-        gameplay = (
-            "Relay gameplay requires different users on consecutive accepted "
-            "messages. Repeating twice in a row breaks the streak."
-            if stats.gameplay_mode == "relay"
-            else "Standard gameplay allows consecutive accepted messages from the same user."
+        matching, gameplay = _rules_text(stats)
+        setup_status = (
+            "This server is configured."
+            if stats is not None
+            else "This server is not configured yet. An administrator can run `/setup`."
         )
         embed = discord.Embed(
-            title="Shoe rules",
-            description=f"{matching}\n\n{gameplay}",
+            title="Shoe Bot help",
+            description=(
+                "A server game that builds a streak from accepted Shoe messages. "
+                + setup_status
+            ),
             colour=EMBED_COLOUR,
+        )
+        embed.add_field(
+            name="Game commands",
+            value=(
+                "`/streak` · `/profile [user]` · `/leaderboard` · "
+                "`/shoehelp` · `/forgetme`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Current rules" if stats is not None else "Recommended defaults",
+            value=f"{matching}\n\n{gameplay}",
+            inline=False,
         )
         embed.add_field(
             name="Always",
@@ -986,27 +1233,12 @@ class ShoeCommands(commands.Cog):
             ),
             inline=False,
         )
-        await _respond(interaction, embed=embed)
-
-    @app_commands.command(name="shoehelp", description="Show Shoe Bot commands")
-    @app_commands.guild_only()
-    async def shoehelp(self, interaction: discord.Interaction) -> None:
-        embed = discord.Embed(
-            title="Shoe Bot help",
-            description="A server game that builds a streak from accepted Shoe messages.",
-            colour=EMBED_COLOUR,
-        )
-        embed.add_field(
-            name="Game commands",
-            value=(
-                "`/count` · `/stats [user]` · `/leaderboard` · `/records` · "
-                "`/achievements [user]` · `/shoerules` · `/forgetme`"
-            ),
-            inline=False,
-        )
         embed.add_field(
             name="Administrator commands",
-            value="`/setup` · `/shoesettings` · `/diagnose` · `/reset`",
+            value=(
+                "`/setup` · `/shoesettings`\n"
+                "Settings includes permission diagnostics and the protected server reset."
+            ),
             inline=False,
         )
         embed.add_field(
@@ -1019,41 +1251,6 @@ class ShoeCommands(commands.Cog):
             inline=False,
         )
         embed.set_footer(text="Administrator commands recheck permission when used.")
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(
-        name="diagnose", description="Check Shoe Bot's channel permissions"
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def diagnose(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        stats = await self._guild_stats_or_error(interaction)
-        if stats is None or interaction.guild is None:
-            return
-        channel = interaction.guild.get_channel(stats.channel_id)
-        if channel is None:
-            status = "Configured channel is missing or unavailable. Run `/setup`."
-        elif not isinstance(channel, discord.TextChannel):
-            status = "Configured channel is not a text channel. Run `/setup`."
-        else:
-            missing = _missing_permissions(interaction.guild, channel)
-            status = "Ready" if not missing else "Missing: " + ", ".join(missing)
-        embed = discord.Embed(
-            title="Shoe Bot diagnostic",
-            description=status,
-            colour=EMBED_COLOUR,
-        )
-        embed.add_field(name="Channel", value=f"<#{stats.channel_id}>", inline=False)
-        embed.add_field(
-            name="Portal setting",
-            value=(
-                "Message Content Intent must also be enabled in the Discord Developer "
-                "Portal. This command cannot inspect that portal setting."
-            ),
-            inline=False,
-        )
         await _respond(
             interaction,
             embed=embed,
@@ -1121,45 +1318,3 @@ class ShoeCommands(commands.Cog):
                     "Could not send deletion fallback (%s)",
                     type(followup_exc).__name__,
                 )
-
-    @app_commands.command(name="reset", description="Reset all Shoe counts in this server")
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def reset(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if await self._guild_stats_or_error(interaction) is None or interaction.guild_id is None:
-            return
-        token = object()
-        guild_id = interaction.guild_id
-        self._pending_reset_tokens[guild_id] = token
-
-        def is_current() -> bool:
-            return self._pending_reset_tokens.get(guild_id) is token
-
-        def finished() -> None:
-            if is_current():
-                self._pending_reset_tokens.pop(guild_id, None)
-
-        try:
-            view = ResetConfirmationView(
-                self._game,
-                guild_id,
-                interaction.user.id,
-                is_current,
-                finished,
-            )
-            message = await interaction.edit_original_response(
-                content=(
-                    "Reset this server's total count, current and best streaks, "
-                    "personal counts, Hall of Fame records, and Relay state? The "
-                    "configured channel and game modes will remain. This cannot be undone."
-                ),
-                view=view,
-            )
-            view.bind_message(message)
-        except BaseException:
-            finished()
-            if "view" in locals():
-                view.stop()
-            raise

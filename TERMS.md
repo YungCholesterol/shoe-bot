@@ -44,13 +44,13 @@ One Discord message can add at most one count. Invalid messages end a non-zero
 streak. Bots and webhooks are ignored. Edits and deletions do not retroactively
 change statistics. Discord-generated system notices are also ignored; ordinary
 messages and replies remain eligible. The exact active rules are available
-through `/shoerules`.
+through `/shoehelp`.
 
-The leaderboard ranks accepted personal contributions. Achievements are fixed
-milestones derived from a user's stored count. The Hall of Fame stores the ten
-highest distinct completed streak lengths for that server; an active streak is
-not added until it ends. These features are a game, not an authoritative record
-of message history or user conduct.
+The leaderboard ranks accepted personal contributions. `/profile` shows fixed
+milestones derived from a user's stored count. The Hall of Fame view inside
+`/leaderboard` shows the ten highest distinct completed streak lengths for that
+server; an active streak is not added until it ends. These features are a game,
+not an authoritative record of message history or user conduct.
 
 ## Administrator controls and responsibility
 
@@ -110,9 +110,9 @@ process memory and configured-channel text is briefly checked for the game.
   longer retained as Relay state. Its aggregate length may enter the Hall of
   Fame without an identity. The outcome is shown ephemerally to the requester;
   no public privacy-request notice is sent.
-- `/reset` allows a current server Administrator to delete all server game
-  counts and records after a private confirmation while preserving the channel
-  and modes.
+- The reset control inside `/shoesettings` allows a current server Administrator
+  to delete all server game counts and records after a private confirmation
+  while preserving the channel and modes.
 - Removing the bot deletes that server's live Shoe Bot configuration and game
   data.
 

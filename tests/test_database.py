@@ -320,6 +320,55 @@ class ShoeDatabaseTests(unittest.TestCase):
         finally:
             second.close()
 
+    def test_leaderboard_snapshot_stays_coherent_during_external_reset(self) -> None:
+        self.configure(gameplay="standard")
+        self.database.record_message(100, 300, True)
+        self.database.record_message(100, 300, True)
+        self.database.record_message(100, None, False)
+        second = ShoeDatabase(self.database_path)
+        stats_read = threading.Event()
+        reset_done = threading.Event()
+        writer_errors: list[BaseException] = []
+        original_get_stats = self.database.get_guild_stats
+        original_checkpoint = second._checkpoint_after_deletion
+
+        def gated_get_stats(*args, **kwargs):
+            result = original_get_stats(*args, **kwargs)
+            stats_read.set()
+            if not reset_done.wait(timeout=5):
+                raise AssertionError("external reset did not finish")
+            return result
+
+        def reset_after_first_read() -> None:
+            try:
+                if not stats_read.wait(timeout=5):
+                    raise AssertionError("snapshot did not reach its first read")
+                second.reset_guild_stats(100)
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                reset_done.set()
+
+        self.database.get_guild_stats = gated_get_stats  # type: ignore[method-assign]
+        second._checkpoint_after_deletion = lambda: None  # type: ignore[method-assign]
+        writer = threading.Thread(target=reset_after_first_read)
+        writer.start()
+        try:
+            snapshot = self.database.get_leaderboard_snapshot(100)
+        finally:
+            self.database.get_guild_stats = original_get_stats  # type: ignore[method-assign]
+            second._checkpoint_after_deletion = original_checkpoint  # type: ignore[method-assign]
+            writer.join(timeout=5)
+            second.close()
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.stats.total_shoes, 2)
+        self.assertEqual(snapshot.contributors[0].shoe_count, 2)
+        self.assertEqual(snapshot.hall_of_fame[0].streak_length, 2)
+        self.assertEqual(self.database.get_guild_stats(100).total_shoes, 0)
+
     def test_two_database_connections_linearize_relay_repeats(self) -> None:
         self.configure()
         self.database.record_message(100, 300, True)

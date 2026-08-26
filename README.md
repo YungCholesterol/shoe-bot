@@ -53,23 +53,19 @@ leaves the active streak unchanged.
 
 | Command | Access | Result |
 | --- | --- | --- |
-| `/count` | Everyone | Show the server's accepted Shoe total. |
-| `/stats [user]` | Everyone | Show server statistics or one user's count, rank, and next achievement. |
-| `/leaderboard` | Everyone | Show the top 10 users by accepted messages. |
-| `/records` | Everyone | Show the top 10 distinct completed streaks. |
-| `/achievements [user]` | Everyone | Show milestones derived from a user's count. |
-| `/shoerules` | Everyone | Show the server's current matching and gameplay rules. |
-| `/shoehelp` | Everyone | Show the command list. |
+| `/streak` | Everyone | Show the current streak, best streak, total count, and active modes. |
+| `/profile [user]` | Everyone | Show a user's accepted count, rank, and milestones; defaults to the caller. |
+| `/leaderboard` | Everyone | Show the top 10 contributors and switch to the Hall of Fame. |
+| `/shoehelp` | Everyone | Show active rules, or recommended defaults before setup, plus commands, policies, and support. |
 | `/forgetme` | Everyone | Delete the caller's stored user ID and personal count. |
 | `/setup` | Administrator | Walk through channel, matching, gameplay, and permission setup. |
-| `/shoesettings` | Administrator | Change the channel or modes without clearing totals or records. |
-| `/diagnose` | Administrator | Check the configured channel and required bot permissions. |
-| `/reset` | Administrator | Reset every count in this server after a private confirmation. |
+| `/shoesettings` | Administrator | Change settings, run diagnostics, or open the protected server reset. |
 
-`/reset` atomically deletes the server's total, current and best streaks,
-personal counts, Hall of Fame records, and Relay state. It preserves the
-configured channel and selected modes. The slash command and its confirmation
-button both recheck the initiating user's Discord **Administrator** permission.
+The reset control inside `/shoesettings` atomically deletes the server's total,
+current and best streaks, personal counts, Hall of Fame records, and Relay
+state. It preserves the configured channel and selected modes. The settings
+command, reset button, and separate confirmation all recheck the initiating
+user's Discord **Administrator** permission.
 
 If `/forgetme` removes the last-contributor ID from an active Relay, that streak
 is completed and its aggregate length can enter the Hall of Fame. The result is
@@ -217,7 +213,8 @@ After connection:
 1. Run `/setup` as a server administrator.
 2. Select the dedicated channel, matching mode, and gameplay mode.
 3. Fix any missing permissions, recheck, and save.
-4. Run `/diagnose` and send test messages in the selected channel.
+4. Open `/shoesettings`, select **Run diagnostic**, and send test messages in
+   the selected channel.
 
 ### Railway
 

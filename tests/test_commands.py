@@ -10,7 +10,12 @@ from unittest.mock import MagicMock
 import discord
 from discord import app_commands
 
-from bot.commands import ResetConfirmationView, SetupWizardView, ShoeCommands
+from bot.commands import (
+    LeaderboardView,
+    ResetConfirmationView,
+    SetupWizardView,
+    ShoeCommands,
+)
 from bot.database import DatabaseError, ShoeDatabase
 from bot.main import BotConfig, ShoeBot
 
@@ -114,16 +119,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             {
                 "setup",
                 "shoesettings",
-                "stats",
+                "streak",
+                "profile",
                 "leaderboard",
-                "count",
-                "records",
-                "achievements",
-                "shoerules",
                 "shoehelp",
-                "diagnose",
                 "forgetme",
-                "reset",
             },
         )
         self.assertTrue(all(command.guild_only for command in commands.values()))
@@ -135,6 +135,13 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "shoeconfig",
             "shoeforgetme",
             "shoereset",
+            "stats",
+            "count",
+            "records",
+            "achievements",
+            "shoerules",
+            "diagnose",
+            "reset",
         ):
             self.assertNotIn(old_name, commands)
 
@@ -145,7 +152,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_mutating_admin_command_has_two_permission_layers(self) -> None:
         await self.bot.add_cog(ShoeCommands(self.database, self.bot.game))
         commands = {command.name: command for command in self.bot.tree.get_commands()}
-        admin_commands = {"setup", "shoesettings", "diagnose", "reset"}
+        admin_commands = {"setup", "shoesettings"}
         for name in admin_commands:
             self.assertTrue(commands[name].default_permissions.administrator)
             self.assertGreaterEqual(len(commands[name].checks), 1)
@@ -248,6 +255,101 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             next(option for option in view.gameplay_select.options if option.value == "relay").default
         )
+        self.assertNotIn(
+            "Reset server data",
+            {getattr(item, "label", None) for item in view.children},
+        )
+
+    async def test_settings_view_contains_diagnostic_and_protected_reset(self) -> None:
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 200
+        channel.mention = "<#200>"
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=False,
+            read_message_history=True,
+        )
+        guild = SimpleNamespace(
+            id=100,
+            me=SimpleNamespace(id=999),
+            get_channel=lambda channel_id: channel if channel_id == 200 else None,
+        )
+
+        async def start_reset(_interaction) -> None:
+            return None
+
+        view = SetupWizardView(
+            game=self.bot.game,
+            guild=guild,  # type: ignore[arg-type]
+            requester_id=300,
+            initial_channel_id=200,
+            initial_matching_mode="creative",
+            initial_gameplay_mode="relay",
+            is_current=lambda: True,
+            finished=lambda: None,
+            title="Settings",
+            start_reset=start_reset,
+        )
+        labels = {getattr(item, "label", None) for item in view.children}
+        self.assertIn("Run diagnostic", labels)
+        self.assertIn("Reset server data", labels)
+        rendered = str(view.build_embed().to_dict())
+        self.assertIn("Missing: Add Reactions", rendered)
+        self.assertIn("Message Content Intent", rendered)
+        self.assertIn("cannot inspect", rendered)
+        interaction = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=True,
+            component=True,
+        )
+        await view.save.callback(interaction)
+        self.assertIn("Run diagnostic", interaction.followup.messages[-1][0])
+
+    async def test_settings_reset_button_hands_off_to_confirmation(self) -> None:
+        self.database.configure_guild(100, 200, "creative", "relay")
+        await self.bot.game.load_configuration()
+        cog = ShoeCommands(self.database, self.bot.game)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 200
+        channel.mention = "<#200>"
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=True,
+            read_message_history=True,
+        )
+        command_interaction = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=True,
+        )
+        command_interaction.guild = SimpleNamespace(
+            id=100,
+            me=SimpleNamespace(id=999),
+            get_channel=lambda channel_id: channel if channel_id == 200 else None,
+        )
+        await ShoeCommands.shoesettings.callback(cog, command_interaction)
+        view = command_interaction.response.messages[-1][1]["view"]
+        labels = {getattr(item, "label", None) for item in view.children}
+        self.assertIn("Run diagnostic", labels)
+        self.assertIn("Reset server data", labels)
+
+        component_interaction = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=True,
+            component=True,
+        )
+        await view.reset_data.callback(component_interaction)
+        reset_view = component_interaction.response.messages[-1][1]["view"]
+        self.assertIsInstance(reset_view, ResetConfirmationView)
+        self.assertTrue(component_interaction.response.is_done())
+        self.assertTrue(view.is_finished())
+        self.assertTrue(all(item.disabled for item in view.children))
+        self.assertNotIn(100, cog._pending_settings_tokens)
+        self.assertIn(100, cog._pending_reset_tokens)
 
     async def test_settings_save_defers_before_commit_and_disables_panel(self) -> None:
         channel = MagicMock(spec=discord.TextChannel)
@@ -396,8 +498,10 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         cog = ShoeCommands(self.database, self.bot.game)
         first = FakeInteraction(user_id=300, guild_id=100, administrator=True)
         second = FakeInteraction(user_id=300, guild_id=100, administrator=True)
-        await ShoeCommands.reset.callback(cog, first)
-        await ShoeCommands.reset.callback(cog, second)
+        await first.response.defer(ephemeral=True, thinking=True)
+        await cog._open_reset_confirmation(first)
+        await second.response.defer(ephemeral=True, thinking=True)
+        await cog._open_reset_confirmation(second)
         first_view = first.response.messages[0][1]["view"]
         second_view = second.response.messages[0][1]["view"]
         self.assertFalse(await first_view.interaction_check(first))
@@ -408,7 +512,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.game.load_configuration()
         cog = ShoeCommands(self.database, self.bot.game)
         interaction = FakeInteraction(user_id=300, guild_id=100, administrator=True)
-        await ShoeCommands.reset.callback(cog, interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await cog._open_reset_confirmation(interaction)
         text = interaction.response.messages[0][0]
         for phrase in (
             "total count",
@@ -423,25 +528,32 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(phrase.casefold(), text.casefold())
         self.assertTrue(interaction.response.defer_ephemeral)
 
-    async def test_reset_defers_before_database_access(self) -> None:
-        self.database.set_shoe_channel(100, 200)
-        await self.bot.game.load_configuration()
-        cog = ShoeCommands(self.database, self.bot.game)
-        interaction = FakeInteraction(user_id=300, guild_id=100, administrator=True)
-        original_run = self.database.run
+    async def test_reset_prompt_opens_only_after_component_is_deferred(self) -> None:
         observed: list[bool] = []
 
-        async def checked_run(operation, *args, **kwargs):
-            observed.append(interaction.response.is_done())
-            return await original_run(operation, *args, **kwargs)
+        async def start_reset(reset_interaction) -> None:
+            observed.append(reset_interaction.response.is_done())
 
-        self.database.run = checked_run  # type: ignore[method-assign]
-        try:
-            await ShoeCommands.reset.callback(cog, interaction)
-        finally:
-            self.database.run = original_run  # type: ignore[method-assign]
-        self.assertTrue(observed)
-        self.assertTrue(all(observed))
+        view = SetupWizardView(
+            game=self.bot.game,
+            guild=SimpleNamespace(id=100),  # type: ignore[arg-type]
+            requester_id=300,
+            initial_channel_id=200,
+            initial_matching_mode="creative",
+            initial_gameplay_mode="relay",
+            is_current=lambda: True,
+            finished=lambda: None,
+            title="Settings",
+            start_reset=start_reset,
+        )
+        interaction = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=True,
+            component=True,
+        )
+        await view.reset_data.callback(interaction)
+        self.assertEqual(observed, [True])
 
     async def test_failed_reset_prompt_publication_clears_pending_token(self) -> None:
         self.database.set_shoe_channel(100, 200)
@@ -453,8 +565,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             administrator=True,
             fail_edit=True,
         )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         with self.assertRaises(discord.HTTPException):
-            await ShoeCommands.reset.callback(cog, interaction)
+            await cog._open_reset_confirmation(interaction)
         self.assertNotIn(100, cog._pending_reset_tokens)
 
     async def test_failed_settings_prompt_publication_clears_pending_token(self) -> None:
@@ -611,41 +724,215 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.database.configure_guild(100, 200, "creative", "standard")
         for user_id in (301, 301, 302):
             self.database.record_message(100, user_id, True)
+        self.database.record_message(100, 303, False)
         await self.bot.game.load_configuration()
         cog = ShoeCommands(self.database, self.bot.game)
         interaction = FakeInteraction(user_id=300, guild_id=100, administrator=False)
-        await ShoeCommands.leaderboard.callback(cog, interaction)
+        original_run = self.database.run
+        operations: list[str] = []
+
+        async def checked_run(operation, *args, **kwargs):
+            operations.append(operation.__name__)
+            return await original_run(operation, *args, **kwargs)
+
+        self.database.run = checked_run  # type: ignore[method-assign]
+        try:
+            await ShoeCommands.leaderboard.callback(cog, interaction)
+        finally:
+            self.database.run = original_run  # type: ignore[method-assign]
+        self.assertEqual(operations, ["get_leaderboard_snapshot"])
         text, kwargs = interaction.response.messages[0]
         embed = kwargs["embed"]
+        view = kwargs["view"]
         rendered = str(embed.to_dict())
         self.assertIsNone(text)
+        self.assertIsInstance(view, LeaderboardView)
         self.assertEqual(embed.title, "Shoe leaderboard")
         self.assertIn("<@301>", rendered)
         self.assertIn("<@302>", rendered)
+
+        toggle = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=False,
+            component=True,
+        )
+        await view.hall_of_fame.callback(toggle)
+        hall_embed = toggle.response.messages[0][1]["embed"]
+        self.assertEqual(hall_embed.title, "Shoe Hall of Fame")
+        self.assertIn("3", str(hall_embed.to_dict()))
         for emoji in ("🤖", "🥇", "🥈", "🥉", "👟", "💥"):
             self.assertNotIn(emoji, rendered)
+            self.assertNotIn(emoji, str(hall_embed.to_dict()))
 
-    async def test_stats_and_achievements_are_derived_from_user_count(self) -> None:
+    async def test_leaderboard_serializes_rapid_clicks_and_timeout(self) -> None:
+        view = LeaderboardView(
+            requester_id=300,
+            guild_id=100,
+            contributors=discord.Embed(title="Contributors"),
+            hall_of_fame=discord.Embed(title="Hall of Fame"),
+        )
+        first = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=False,
+            component=True,
+        )
+        second = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=False,
+            component=True,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_edit = first.edit_original_response
+
+        async def gated_edit(**kwargs):
+            started.set()
+            await release.wait()
+            return await original_edit(**kwargs)
+
+        first.edit_original_response = gated_edit  # type: ignore[method-assign]
+        first_click = asyncio.create_task(view.hall_of_fame.callback(first))
+        await started.wait()
+        second_click = asyncio.create_task(view.contributors.callback(second))
+        await asyncio.sleep(0)
+        self.assertTrue(first.response.is_done())
+        self.assertTrue(second.response.is_done())
+        timeout = asyncio.create_task(view.on_timeout())
+        release.set()
+        await asyncio.gather(first_click, second_click, timeout)
+        self.assertTrue(view.is_finished())
+        self.assertTrue(all(item.disabled for item in view.children))
+
+    async def test_leaderboard_controls_are_bound_to_requester_and_guild(self) -> None:
+        view = LeaderboardView(
+            requester_id=300,
+            guild_id=100,
+            contributors=discord.Embed(title="Contributors"),
+            hall_of_fame=discord.Embed(title="Hall of Fame"),
+        )
+        wrong_user = FakeInteraction(
+            user_id=301,
+            guild_id=100,
+            administrator=False,
+            component=True,
+        )
+        wrong_guild = FakeInteraction(
+            user_id=300,
+            guild_id=101,
+            administrator=False,
+            component=True,
+        )
+        self.assertFalse(await view.interaction_check(wrong_user))
+        self.assertFalse(await view.interaction_check(wrong_guild))
+        self.assertTrue(wrong_user.response.messages[-1][1]["ephemeral"])
+        self.assertTrue(wrong_guild.response.messages[-1][1]["ephemeral"])
+
+    async def test_leaderboard_timeout_disables_message_after_framework_stops_view(self) -> None:
+        view = LeaderboardView(
+            requester_id=300,
+            guild_id=100,
+            contributors=discord.Embed(title="Contributors"),
+            hall_of_fame=discord.Embed(title="Hall of Fame"),
+        )
+        edits: list[dict] = []
+
+        async def edit(**kwargs) -> None:
+            edits.append(kwargs)
+
+        view.bind_message(SimpleNamespace(edit=edit))  # type: ignore[arg-type]
+        view.stop()  # discord.py marks a view finished before calling on_timeout().
+        await view.on_timeout()
+        self.assertEqual(len(edits), 1)
+        self.assertIs(edits[0]["view"], view)
+        self.assertTrue(all(item.disabled for item in view.children))
+
+    async def test_component_errors_replace_panels_with_disabled_terminal_state(self) -> None:
+        finished = 0
+
+        def mark_finished() -> None:
+            nonlocal finished
+            finished += 1
+
+        settings = SetupWizardView(
+            game=self.bot.game,
+            guild=SimpleNamespace(id=100),  # type: ignore[arg-type]
+            requester_id=300,
+            initial_channel_id=200,
+            initial_matching_mode="creative",
+            initial_gameplay_mode="relay",
+            is_current=lambda: True,
+            finished=mark_finished,
+            title="Settings",
+        )
+        reset = ResetConfirmationView(
+            self.bot.game,
+            100,
+            300,
+            lambda: True,
+            mark_finished,
+        )
+        leaderboard = LeaderboardView(
+            requester_id=300,
+            guild_id=100,
+            contributors=discord.Embed(title="Contributors"),
+            hall_of_fame=discord.Embed(title="Hall of Fame"),
+        )
+        for view, item in (
+            (settings, settings.cancel),
+            (reset, reset.cancel),
+            (leaderboard, leaderboard.contributors),
+        ):
+            with self.subTest(view=type(view).__name__):
+                interaction = FakeInteraction(
+                    user_id=300,
+                    guild_id=100,
+                    administrator=True,
+                    component=True,
+                )
+                await view.on_error(interaction, RuntimeError("simulated"), item)
+                text, kwargs = interaction.response.messages[-1]
+                self.assertTrue(text)
+                self.assertIs(kwargs["view"], view)
+                self.assertTrue(view.is_finished())
+                self.assertTrue(all(child.disabled for child in view.children))
+        self.assertEqual(finished, 2)
+
+    async def test_streak_combines_total_current_best_and_modes(self) -> None:
+        self.database.configure_guild(100, 200, "classic", "standard")
+        self.database.record_message(100, 301, True)
+        self.database.record_message(100, 302, True)
+        await self.bot.game.load_configuration()
+        cog = ShoeCommands(self.database, self.bot.game)
+        interaction = FakeInteraction(user_id=300, guild_id=100, administrator=False)
+        await ShoeCommands.streak.callback(cog, interaction)
+        embed = interaction.response.messages[0][1]["embed"]
+        rendered = str(embed.to_dict())
+        self.assertEqual(embed.title, "Shoe streak")
+        self.assertIn("Current streak", rendered)
+        self.assertIn("Best streak", rendered)
+        self.assertIn("Total accepted", rendered)
+        self.assertIn("Classic matching · Standard gameplay", rendered)
+
+    async def test_profile_combines_count_rank_and_milestones(self) -> None:
         self.database.configure_guild(100, 200, "creative", "standard")
         for _ in range(10):
             self.database.record_message(100, 301, True)
         await self.bot.game.load_configuration()
         cog = ShoeCommands(self.database, self.bot.game)
-        target = SimpleNamespace(id=301, mention="<@301>")
-
-        stats_interaction = FakeInteraction(
-            user_id=300, guild_id=100, administrator=False
+        interaction = FakeInteraction(
+            user_id=301, guild_id=100, administrator=False
         )
-        await ShoeCommands.stats.callback(cog, stats_interaction, target)
-        self.assertFalse(stats_interaction.response.defer_ephemeral)
-        stats_embed = stats_interaction.response.messages[0][1]["embed"]
-        self.assertIn("10 / 25", str(stats_embed.to_dict()))
-
-        achievement_interaction = FakeInteraction(
-            user_id=300, guild_id=100, administrator=False
-        )
-        await ShoeCommands.achievements.callback(cog, achievement_interaction, target)
-        rendered = str(achievement_interaction.response.messages[0][1]["embed"].to_dict())
+        await ShoeCommands.profile.callback(cog, interaction, None)
+        self.assertFalse(interaction.response.defer_ephemeral)
+        embed = interaction.response.messages[0][1]["embed"]
+        rendered = str(embed.to_dict())
+        self.assertEqual(embed.title, "Shoe profile")
+        self.assertIn("<@301>", rendered)
+        self.assertIn("Leaderboard rank", rendered)
+        self.assertIn("10 / 25", rendered)
         self.assertIn("Unlocked · 10 accepted messages", rendered)
         self.assertIn("Locked · 25 accepted messages", rendered)
 
@@ -664,26 +951,52 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("deleted", interaction.response.messages[0][0].casefold())
 
     async def test_help_lists_all_admin_commands_and_current_public_names(self) -> None:
+        self.database.configure_guild(100, 200, "classic", "standard")
         cog = ShoeCommands(self.database, self.bot.game)
         interaction = FakeInteraction(user_id=300, guild_id=100, administrator=False)
         await ShoeCommands.shoehelp.callback(cog, interaction)
         rendered = str(interaction.response.messages[0][1]["embed"].to_dict())
         for command in (
-            "/count",
-            "/stats",
+            "/streak",
+            "/profile",
             "/leaderboard",
-            "/records",
-            "/achievements",
+            "/shoehelp",
+            "/forgetme",
             "/setup",
             "/shoesettings",
+        ):
+            self.assertIn(command, rendered)
+        for removed in (
+            "/count",
+            "/stats",
+            "/records",
+            "/achievements",
+            "/shoerules",
             "/diagnose",
             "/reset",
         ):
-            self.assertIn(command, rendered)
+            self.assertNotIn(f"`{removed}`", rendered)
+        self.assertIn("Classic matching", rendered)
+        self.assertIn("Standard gameplay", rendered)
+        self.assertIn("permission diagnostics", rendered)
+        self.assertIn("protected server reset", rendered)
         self.assertIn("PRIVACY.md", rendered)
         self.assertIn("TERMS.md", rendered)
         self.assertIn("yungcholesterol@gmail.com", rendered)
         self.assertIn("not affiliated", rendered)
+
+    async def test_help_labels_unconfigured_rules_as_recommended_defaults(self) -> None:
+        cog = ShoeCommands(self.database, self.bot.game)
+        interaction = FakeInteraction(user_id=300, guild_id=100, administrator=False)
+        await ShoeCommands.shoehelp.callback(cog, interaction)
+        embed = interaction.response.messages[0][1]["embed"]
+        rendered = str(embed.to_dict())
+        self.assertIn("not configured yet", rendered)
+        self.assertIn("/setup", rendered)
+        self.assertIn("Recommended defaults", rendered)
+        self.assertNotIn("Current rules", rendered)
+        self.assertIn("Creative matching", rendered)
+        self.assertIn("Relay gameplay", rendered)
 
 
 if __name__ == "__main__":

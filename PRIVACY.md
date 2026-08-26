@@ -53,14 +53,14 @@ therefore never retroactively change counters.
 | --- | --- | --- |
 | Discord server ID and configured channel ID | Keep each server's game separate and route new events | Until the bot is removed from the server |
 | Matching mode and gameplay mode | Apply that server's selected rules | Until changed or the bot is removed |
-| Global total, current streak, and best streak | Provide server statistics | Until `/reset` or removal |
-| Discord user ID and accepted-message count | Personal statistics, achievements, and leaderboard ranking | Until `/forgetme`, `/reset`, or removal |
-| Last accepted contributor's Discord user ID in an active Relay | Enforce different consecutive contributors across messages and restarts | Until the streak ends, relevant settings change, `/forgetme`, `/reset`, or removal |
-| Completed streak length, completion time, and legacy-record flag | Maintain an aggregate top-10 Hall of Fame | Until pruned from the top 10, `/reset`, or removal |
+| Global total, current streak, and best streak | Provide server statistics | Until the reset control in `/shoesettings` is confirmed or the bot is removed |
+| Discord user ID and accepted-message count | Personal statistics, milestones, and leaderboard ranking | Until `/forgetme`, a confirmed server reset, or removal |
+| Last accepted contributor's Discord user ID in an active Relay | Enforce different consecutive contributors across messages and restarts | Until the streak ends, relevant settings change, `/forgetme`, a confirmed server reset, or removal |
+| Completed streak length, completion time, and legacy-record flag | Maintain an aggregate top-10 Hall of Fame | Until pruned from the top 10, a confirmed server reset, or removal |
 
-Hall of Fame rows contain no contributor or breaker ID. Achievements are
+Hall of Fame rows contain no contributor or breaker ID. Milestones are
 calculated from the stored personal count and do not require a separate
-achievement profile. A legacy Hall of Fame record has no exact completion time
+milestone profile. A legacy Hall of Fame record has no exact completion time
 because it was migrated from the best streak stored by an earlier release.
 
 SQLite may use associated WAL and shared-memory files containing the same
@@ -107,7 +107,7 @@ Support-email data is separate and described below.
 ## Information shown inside a server
 
 Game responses share limited information with members who can use commands or
-see the configured channel. Public statistics, leaderboard, and achievement
+see the configured channel. Public statistics, leaderboard, and profile
 responses may turn a stored Discord user ID into a Discord mention and show its
 count, rank, or derived milestones. A streak-break message shows the breaker's
 Discord mention and the aggregate streak length that ended. Hall of Fame and
@@ -120,7 +120,7 @@ The stored data is used only to:
 
 - Run the selected game in each configured server channel
 - Enforce Relay alternation when enabled
-- Show server and personal statistics, rankings, records, and achievements
+- Show server and personal statistics, rankings, Hall of Fame records, and milestones
 - Apply administrator settings, diagnostics, resets, and uninstall cleanup
 - Fulfill a user's personal deletion request
 
@@ -183,9 +183,10 @@ policy violation to Discord or another required authority.
 
 ## Access, deletion, and retention
 
-- `/stats user:@user` displays the stored count and rank for a user in that
-  server. `/achievements user:@user` displays milestones derived from that
-  count.
+- `/profile user:@user` displays the stored count, rank, and milestones derived
+  from that count. Omitting the user displays the caller's profile.
+- `/leaderboard` displays the top contributors and provides a Hall of Fame view
+  containing aggregate completed-streak records.
 - `/forgetme` deletes the caller's Discord user ID and personal count in that
   server. Aggregate total and best-streak values remain and may no longer equal
   the sum of visible leaderboard rows. If the caller is the last contributor to
@@ -198,9 +199,10 @@ policy violation to Discord or another required authority.
   non-zero active streak and may add its aggregate length to the Hall of Fame.
   Totals, best streak, user counts, and existing Hall records are not cleared.
   Saving identical settings leaves the active streak unchanged.
-- `/reset` lets a current server Administrator delete all of that server's
-  counts, streaks, user rows, Hall of Fame rows, and Relay state after a private,
-  requester-bound confirmation. The selected channel and modes remain.
+- The reset control inside `/shoesettings` lets a current server Administrator
+  delete all of that server's counts, streaks, user rows, Hall of Fame rows, and
+  Relay state after a private, requester-bound confirmation. The selected
+  channel and modes remain.
 - Removing Shoe Bot from a server deletes that server's live configuration and
   game data. Startup reconciliation handles a removal that occurred while the
   bot was offline.
@@ -216,10 +218,10 @@ copies may expire on Railway's schedule.
 Because message text is not retained, the operator cannot reconstruct past
 messages when resolving a disputed count.
 
-Use `/stats user:@you` to view your personal count and rank, `/forgetme` to
-delete your own stored user row, or ask a server Administrator to use `/reset`
-for a complete server reset. These authenticated Discord actions are the
-preferred identity checks. If they are unavailable, contact
+Use `/profile` to view your personal count, rank, and milestones, `/forgetme` to
+delete your own stored user row, or ask a server Administrator to use the reset
+control inside `/shoesettings` for a complete server reset. These authenticated
+Discord actions are the preferred identity checks. If they are unavailable, contact
 [yungcholesterol@gmail.com](mailto:yungcholesterol@gmail.com) without including
 a Discord user/server ID or other Discord API data; the operator can arrange an
 in-Discord verification step. Do not send message content, passwords,

@@ -86,6 +86,13 @@ class HallOfFameEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class LeaderboardSnapshot:
+    stats: GuildStats
+    contributors: tuple[LeaderboardEntry, ...]
+    hall_of_fame: tuple[HallOfFameEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class UserDeletion:
     deleted: bool
     ended_relay_streak: int
@@ -402,6 +409,21 @@ class ShoeDatabase:
             except sqlite3.Error as exc:
                 self._rollback_without_masking_error()
                 raise DatabaseError("SQLite write failed") from exc
+            except Exception:
+                self._rollback_without_masking_error()
+                raise
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Hold one WAL snapshot across a multi-query read."""
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN")
+                yield self._connection
+                self._connection.execute("COMMIT")
+            except sqlite3.Error as exc:
+                self._rollback_without_masking_error()
+                raise DatabaseError("SQLite read failed") from exc
             except Exception:
                 self._rollback_without_masking_error()
                 raise
@@ -857,6 +879,21 @@ class ShoeDatabase:
             )
             for index, row in enumerate(rows, start=1)
         ]
+
+    def get_leaderboard_snapshot(
+        self,
+        guild_id: int | str,
+        limit: int = 10,
+    ) -> LeaderboardSnapshot | None:
+        """Read the stats and both leaderboard panels from one WAL snapshot."""
+        guild = self._snowflake(guild_id, "guild_id")
+        with self._read_transaction():
+            stats = self.get_guild_stats(guild)
+            if stats is None:
+                return None
+            contributors = tuple(self.get_leaderboard(guild, limit=limit))
+            hall_of_fame = tuple(self.get_hall_of_fame(guild, limit=min(limit, 10)))
+            return LeaderboardSnapshot(stats, contributors, hall_of_fame)
 
     def reset_guild_stats(self, guild_id: int | str) -> None:
         """Delete all counts while preserving the selected channel and modes."""
