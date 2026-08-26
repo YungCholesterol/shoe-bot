@@ -79,6 +79,10 @@ class ShoeBot(commands.Bot):
             command_prefix=commands.when_mentioned,
             intents=intents,
             application_id=config.application_id,
+            allowed_installs=app_commands.AppInstallationType(
+                guild=True,
+                user=False,
+            ),
             allowed_mentions=discord.AllowedMentions.none(),
             max_messages=None,
             member_cache_flags=discord.MemberCacheFlags.none(),
@@ -89,7 +93,7 @@ class ShoeBot(commands.Bot):
         self.tree.on_error = self.on_app_command_error
 
     async def setup_hook(self) -> None:
-        self.game.load_configuration()
+        await self.game.load_configuration()
         await self.add_cog(ShoeCommands(self.database, self.game))
 
         try:
@@ -111,7 +115,7 @@ class ShoeBot(commands.Bot):
         stale_guild_ids = self.game.configured_guild_ids() - installed_guild_ids
         for guild_id in stale_guild_ids:
             try:
-                self.game.remove_guild(guild_id)
+                await self.game.remove_guild(guild_id)
             except DatabaseError as exc:
                 LOGGER.error(
                     "Could not purge stale server data (%s)", type(exc).__name__
@@ -124,7 +128,7 @@ class ShoeBot(commands.Bot):
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         try:
-            self.game.remove_guild(guild.id)
+            await self.game.remove_guild(guild.id)
         except DatabaseError as exc:
             LOGGER.error(
                 "Could not purge data for a removed server (%s)", type(exc).__name__
@@ -161,7 +165,7 @@ class ShoeBot(commands.Bot):
         try:
             await super().close()
         finally:
-            self.database.close()
+            await self.game.aclose()
 
 
 def main() -> None:

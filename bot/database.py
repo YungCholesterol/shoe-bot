@@ -1,16 +1,31 @@
-"""SQLite persistence for Shoe Bot.
+"""Transaction-safe SQLite persistence for Shoe Bot.
 
-Only Discord snowflake IDs and numerical game statistics are persisted here.
+Only Discord snowflake IDs, server configuration, and numerical game statistics
+are persisted. Message text never enters this module.
 """
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
+import logging
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Iterator
+from typing import Callable, Iterator, Literal, TypeVar
+
+
+MatchingMode = Literal["classic", "creative"]
+GameplayMode = Literal["standard", "relay"]
+BreakReason = Literal["invalid", "relay"]
+
+MATCHING_MODES = frozenset({"classic", "creative"})
+GAMEPLAY_MODES = frozenset({"standard", "relay"})
+LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class DatabaseError(RuntimeError):
@@ -22,11 +37,20 @@ class GuildNotConfigured(DatabaseError):
 
 
 @dataclass(frozen=True, slots=True)
+class GuildConfig:
+    channel_id: int
+    matching_mode: MatchingMode
+    gameplay_mode: GameplayMode
+
+
+@dataclass(frozen=True, slots=True)
 class GuildStats:
     channel_id: int
     total_shoes: int
     current_streak: int
     best_streak: int
+    matching_mode: MatchingMode
+    gameplay_mode: GameplayMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +59,9 @@ class MessageUpdate:
     current_streak: int
     best_streak: int
     previous_streak: int
+    accepted: bool
+    break_reason: BreakReason | None
+    hall_of_fame_rank: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,11 +77,26 @@ class LeaderboardEntry:
     rank: int
 
 
-class ShoeDatabase:
-    """Small, transaction-safe SQLite data store.
+@dataclass(frozen=True, slots=True)
+class HallOfFameEntry:
+    rank: int
+    streak_length: int
+    completed_at: int | None
+    is_legacy: bool
 
-    A re-entrant lock serializes access to the shared connection. Write methods
-    also use BEGIN IMMEDIATE so each message update is atomic.
+
+@dataclass(frozen=True, slots=True)
+class UserDeletion:
+    deleted: bool
+    ended_relay_streak: int
+
+
+class ShoeDatabase:
+    """Small, durable SQLite data store shared by the Discord event loop.
+
+    A re-entrant process lock serializes access to the single connection. Every
+    game-changing operation also uses ``BEGIN IMMEDIATE``, making Relay checks,
+    counter changes, user totals, and Hall-of-Fame writes one atomic unit.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -75,41 +117,261 @@ class ShoeDatabase:
             self._connection.execute("PRAGMA busy_timeout = 5000")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
+            self._connection.execute("PRAGMA secure_delete = ON")
             self._initialize_schema()
         except sqlite3.Error as exc:
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 connection.close()
             raise DatabaseError("Could not initialize the SQLite database") from exc
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="shoe-sqlite",
+        )
+        self._executor_state_lock = threading.Lock()
+        self._executor_closed = False
+        self._closing = False
+        self._close_future = None
+        self._aclose_task: asyncio.Task[None] | None = None
+
+    async def run(
+        self,
+        operation: Callable[..., T],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> T:
+        """Run one database operation on the ordered SQLite worker.
+
+        Discord dispatches message handlers concurrently. A single worker keeps
+        their database transitions in submission order while ensuring SQLite
+        waits and durable fsyncs never block the Discord event loop.
+        """
+        loop = asyncio.get_running_loop()
+        with self._executor_state_lock:
+            if self._executor_closed or self._closing:
+                raise DatabaseError("The SQLite worker is closed")
+            try:
+                future = self._executor.submit(
+                    partial(operation, *args, **kwargs)
+                )
+            except RuntimeError as exc:
+                raise DatabaseError("The SQLite worker is unavailable") from exc
+        wrapped = asyncio.wrap_future(future, loop=loop)
+
+        def retrieve_late_exception(completed: asyncio.Future[T]) -> None:
+            if completed.cancelled():
+                return
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        wrapped.add_done_callback(retrieve_late_exception)
+        return await asyncio.shield(wrapped)
 
     def _initialize_schema(self) -> None:
-        self._connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id TEXT PRIMARY KEY NOT NULL,
-                shoe_channel_id TEXT NOT NULL,
-                total_shoes INTEGER NOT NULL DEFAULT 0 CHECK (total_shoes >= 0),
-                current_streak INTEGER NOT NULL DEFAULT 0 CHECK (current_streak >= 0),
-                best_streak INTEGER NOT NULL DEFAULT 0 CHECK (
-                    best_streak >= current_streak
-                    AND best_streak <= total_shoes
+        # Do not use executescript here: it can commit before every migration
+        # statement. One explicit transaction makes a production upgrade either
+        # fully visible or fully rolled back after interruption.
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            user_version = int(
+                self._connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if user_version > 2:
+                raise sqlite3.DatabaseError(
+                    "Database schema is newer than this Shoe Bot release"
                 )
-            );
 
-            CREATE TABLE IF NOT EXISTS user_stats (
-                guild_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                shoe_count INTEGER NOT NULL DEFAULT 0 CHECK (shoe_count >= 0),
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id)
-                    REFERENCES guild_settings(guild_id)
-                    ON DELETE CASCADE
-            ) WITHOUT ROWID;
+            existing = self._connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'guild_settings'
+                """
+            ).fetchone()
+            if user_version == 2 and existing is None:
+                raise sqlite3.DatabaseError(
+                    "Version 2 database is missing guild_settings"
+                )
+            old_columns: set[str] = set()
+            if existing is not None:
+                old_columns = {
+                    str(row["name"])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(guild_settings)"
+                    ).fetchall()
+                }
+                if user_version == 2:
+                    required = {
+                        "guild_id",
+                        "shoe_channel_id",
+                        "total_shoes",
+                        "current_streak",
+                        "best_streak",
+                        "matching_mode",
+                        "gameplay_mode",
+                        "last_contributor_user_id",
+                    }
+                    if not required.issubset(old_columns):
+                        raise sqlite3.DatabaseError(
+                            "Version 2 database is missing required columns"
+                        )
+                    tables = {
+                        str(row["name"])
+                        for row in self._connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall()
+                    }
+                    if not {
+                        "guild_settings",
+                        "user_stats",
+                        "hall_of_fame",
+                        "schema_metadata",
+                    }.issubset(tables):
+                        raise sqlite3.DatabaseError(
+                            "Version 2 database is missing required tables"
+                        )
+                    metadata = self._connection.execute(
+                        """
+                        SELECT metadata_value FROM schema_metadata
+                        WHERE metadata_key = 'schema_version'
+                        """
+                    ).fetchone()
+                    if metadata is None or metadata["metadata_value"] != "2":
+                        raise sqlite3.DatabaseError(
+                            "Database schema version markers disagree"
+                        )
+            else:
+                self._connection.execute(
+                    """
+                    CREATE TABLE guild_settings (
+                        guild_id TEXT PRIMARY KEY NOT NULL,
+                        shoe_channel_id TEXT NOT NULL,
+                        total_shoes INTEGER NOT NULL DEFAULT 0
+                            CHECK (total_shoes >= 0),
+                        current_streak INTEGER NOT NULL DEFAULT 0
+                            CHECK (current_streak >= 0),
+                        best_streak INTEGER NOT NULL DEFAULT 0 CHECK (
+                            best_streak >= current_streak
+                            AND best_streak <= total_shoes
+                        ),
+                        matching_mode TEXT NOT NULL DEFAULT 'creative'
+                            CHECK (matching_mode IN ('classic', 'creative')),
+                        gameplay_mode TEXT NOT NULL DEFAULT 'relay'
+                            CHECK (gameplay_mode IN ('standard', 'relay')),
+                        last_contributor_user_id TEXT
+                    )
+                    """
+                )
 
-            CREATE INDEX IF NOT EXISTS idx_user_stats_leaderboard
-                ON user_stats (guild_id, shoe_count DESC);
-            """
-        )
+            additions = {
+                "matching_mode": (
+                    "ALTER TABLE guild_settings ADD COLUMN matching_mode TEXT "
+                    "NOT NULL DEFAULT 'creative' "
+                    "CHECK (matching_mode IN ('classic', 'creative'))"
+                ),
+                "gameplay_mode": (
+                    "ALTER TABLE guild_settings ADD COLUMN gameplay_mode TEXT "
+                    "NOT NULL DEFAULT 'relay' "
+                    "CHECK (gameplay_mode IN ('standard', 'relay'))"
+                ),
+                "last_contributor_user_id": (
+                    "ALTER TABLE guild_settings ADD COLUMN "
+                    "last_contributor_user_id TEXT"
+                ),
+            }
+            if existing is not None and user_version < 2:
+                for column, statement in additions.items():
+                    if column not in old_columns:
+                        self._connection.execute(statement)
+
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    shoe_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (shoe_count >= 0),
+                    PRIMARY KEY (guild_id, user_id),
+                    FOREIGN KEY (guild_id)
+                        REFERENCES guild_settings(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_stats_leaderboard
+                ON user_stats (guild_id, shoe_count DESC, user_id ASC)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hall_of_fame (
+                    guild_id TEXT NOT NULL,
+                    streak_length INTEGER NOT NULL CHECK (streak_length > 0),
+                    completed_at INTEGER,
+                    is_legacy INTEGER NOT NULL DEFAULT 0
+                        CHECK (is_legacy IN (0, 1)),
+                    PRIMARY KEY (guild_id, streak_length),
+                    FOREIGN KEY (guild_id)
+                        REFERENCES guild_settings(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_hall_of_fame_ranking
+                ON hall_of_fame (guild_id, streak_length DESC)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_metadata (
+                    metadata_key TEXT PRIMARY KEY NOT NULL,
+                    metadata_value TEXT NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+
+            if existing is not None and user_version < 2:
+                # Preserve the historical best without inventing a completion date.
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO hall_of_fame (
+                        guild_id, streak_length, completed_at, is_legacy
+                    )
+                    SELECT guild_id, best_streak, NULL, 1
+                    FROM guild_settings
+                    WHERE best_streak > 0
+                    """
+                )
+                self._connection.execute(
+                    "UPDATE guild_settings SET last_contributor_user_id = NULL"
+                )
+
+            self._connection.execute(
+                """
+                INSERT INTO schema_metadata (metadata_key, metadata_value)
+                VALUES ('schema_version', '2')
+                ON CONFLICT (metadata_key) DO UPDATE SET
+                    metadata_value = excluded.metadata_value
+                """
+            )
+            if (
+                self._connection.execute("PRAGMA foreign_key_check").fetchone()
+                is not None
+            ):
+                raise sqlite3.DatabaseError(
+                    "Database foreign-key integrity check failed"
+                )
+            self._connection.execute("PRAGMA user_version = 2")
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._rollback_without_masking_error()
+            raise
 
     @staticmethod
     def _snowflake(value: int | str, label: str) -> str:
@@ -117,6 +379,18 @@ class ShoeDatabase:
         if not text.isdecimal() or int(text) <= 0:
             raise ValueError(f"{label} must be a positive Discord ID")
         return text
+
+    @staticmethod
+    def _matching_mode(value: str) -> MatchingMode:
+        if value not in MATCHING_MODES:
+            raise ValueError("matching_mode must be 'classic' or 'creative'")
+        return value  # type: ignore[return-value]
+
+    @staticmethod
+    def _gameplay_mode(value: str) -> GameplayMode:
+        if value not in GAMEPLAY_MODES:
+            raise ValueError("gameplay_mode must be 'standard' or 'relay'")
+        return value  # type: ignore[return-value]
 
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -138,29 +412,223 @@ class ShoeDatabase:
         try:
             self._connection.execute("ROLLBACK")
         except sqlite3.Error:
-            # Preserve the original operation error; SQLite will recover the WAL
-            # when the connection or process is reopened.
             pass
 
-    def load_configured_channels(self) -> dict[int, int]:
+    def _checkpoint_after_deletion(self) -> None:
+        """Best-effort WAL truncation after a privacy or server deletion."""
+        with self._lock:
+            try:
+                result = self._connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if result is not None and int(result[0]) != 0:
+                    LOGGER.warning("SQLite WAL checkpoint remained busy after deletion")
+            except sqlite3.Error:
+                # The logical delete is already committed. A later checkpoint or
+                # close will safely retry truncating the WAL.
+                pass
+
+    @staticmethod
+    def _record_completed_streak(
+        connection: sqlite3.Connection,
+        guild: str,
+        streak_length: int,
+    ) -> int | None:
+        """Insert/prune one aggregate completed streak inside a caller transaction.
+
+        The returned rank is only for a newly added length that remains in the
+        top ten. Existing lengths and lengths pruned immediately return ``None``.
+        """
+        if streak_length <= 0:
+            return None
+        existing = connection.execute(
+            """
+            SELECT 1 FROM hall_of_fame
+            WHERE guild_id = ? AND streak_length = ?
+            """,
+            (guild, streak_length),
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO hall_of_fame (
+                guild_id, streak_length, completed_at, is_legacy
+            )
+            VALUES (?, ?, CAST(strftime('%s', 'now') AS INTEGER), 0)
+            ON CONFLICT (guild_id, streak_length) DO UPDATE SET
+                completed_at = CASE
+                    WHEN hall_of_fame.is_legacy = 1
+                    THEN excluded.completed_at
+                    ELSE hall_of_fame.completed_at
+                END,
+                is_legacy = 0
+            """,
+            (guild, streak_length),
+        )
+        connection.execute(
+            """
+            DELETE FROM hall_of_fame
+            WHERE guild_id = ?
+              AND streak_length NOT IN (
+                  SELECT streak_length
+                  FROM hall_of_fame
+                  WHERE guild_id = ?
+                  ORDER BY streak_length DESC
+                  LIMIT 10
+              )
+            """,
+            (guild, guild),
+        )
+        if existing is not None:
+            return None
+        retained = connection.execute(
+            """
+            SELECT 1 + (
+                SELECT COUNT(*)
+                FROM hall_of_fame AS higher
+                WHERE higher.guild_id = current.guild_id
+                  AND higher.streak_length > current.streak_length
+            ) AS hall_rank
+            FROM hall_of_fame AS current
+            WHERE current.guild_id = ? AND current.streak_length = ?
+            """,
+            (guild, streak_length),
+        ).fetchone()
+        return int(retained["hall_rank"]) if retained is not None else None
+
+    def load_guild_configs(self) -> dict[int, GuildConfig]:
         with self._lock:
             try:
                 rows = self._connection.execute(
-                    "SELECT guild_id, shoe_channel_id FROM guild_settings"
+                    """
+                    SELECT guild_id, shoe_channel_id, matching_mode, gameplay_mode
+                    FROM guild_settings
+                    """
                 ).fetchall()
             except sqlite3.Error as exc:
-                raise DatabaseError("Could not load guild configuration") from exc
-        return {int(row["guild_id"]): int(row["shoe_channel_id"]) for row in rows}
+                raise DatabaseError("Could not load server configuration") from exc
+        return {
+            int(row["guild_id"]): GuildConfig(
+                channel_id=int(row["shoe_channel_id"]),
+                matching_mode=self._matching_mode(str(row["matching_mode"])),
+                gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
+            )
+            for row in rows
+        }
+
+    def load_configured_channels(self) -> dict[int, int]:
+        """Backward-compatible channel-only view used by older integrations."""
+        return {
+            guild_id: config.channel_id
+            for guild_id, config in self.load_guild_configs().items()
+        }
+
+    def configure_guild(
+        self,
+        guild_id: int | str,
+        channel_id: int | str,
+        matching_mode: str = "creative",
+        gameplay_mode: str = "relay",
+    ) -> GuildConfig:
+        guild = self._snowflake(guild_id, "guild_id")
+        channel = self._snowflake(channel_id, "channel_id")
+        matching = self._matching_mode(matching_mode)
+        gameplay = self._gameplay_mode(gameplay_mode)
+        with self._write_transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT shoe_channel_id, matching_mode, gameplay_mode,
+                       current_streak
+                FROM guild_settings
+                WHERE guild_id = ?
+                """,
+                (guild,),
+            ).fetchone()
+            settings_changed = bool(
+                existing is not None
+                and (
+                    str(existing["shoe_channel_id"]) != channel
+                    or str(existing["matching_mode"]) != matching
+                    or str(existing["gameplay_mode"]) != gameplay
+                )
+            )
+            if settings_changed and int(existing["current_streak"]) > 0:
+                self._record_completed_streak(
+                    connection,
+                    guild,
+                    int(existing["current_streak"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE guild_settings
+                    SET current_streak = 0, last_contributor_user_id = NULL
+                    WHERE guild_id = ?
+                    """,
+                    (guild,),
+                )
+            connection.execute(
+                """
+                INSERT INTO guild_settings (
+                    guild_id, shoe_channel_id, matching_mode, gameplay_mode
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (guild_id) DO UPDATE SET
+                    last_contributor_user_id = CASE
+                        WHEN excluded.gameplay_mode = 'standard'
+                          OR guild_settings.shoe_channel_id != excluded.shoe_channel_id
+                          OR guild_settings.matching_mode != excluded.matching_mode
+                          OR guild_settings.gameplay_mode != excluded.gameplay_mode
+                        THEN NULL
+                        ELSE guild_settings.last_contributor_user_id
+                    END,
+                    shoe_channel_id = excluded.shoe_channel_id,
+                    matching_mode = excluded.matching_mode,
+                    gameplay_mode = excluded.gameplay_mode
+                """,
+                (guild, channel, matching, gameplay),
+            )
+        return GuildConfig(int(channel), matching, gameplay)
 
     def set_shoe_channel(self, guild_id: int | str, channel_id: int | str) -> None:
         guild = self._snowflake(guild_id, "guild_id")
         channel = self._snowflake(channel_id, "channel_id")
         with self._write_transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT shoe_channel_id, current_streak
+                FROM guild_settings
+                WHERE guild_id = ?
+                """,
+                (guild,),
+            ).fetchone()
+            if (
+                existing is not None
+                and str(existing["shoe_channel_id"]) != channel
+                and int(existing["current_streak"]) > 0
+            ):
+                self._record_completed_streak(
+                    connection,
+                    guild,
+                    int(existing["current_streak"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE guild_settings
+                    SET current_streak = 0, last_contributor_user_id = NULL
+                    WHERE guild_id = ?
+                    """,
+                    (guild,),
+                )
             connection.execute(
                 """
                 INSERT INTO guild_settings (guild_id, shoe_channel_id)
                 VALUES (?, ?)
                 ON CONFLICT (guild_id) DO UPDATE SET
+                    last_contributor_user_id = CASE
+                        WHEN guild_settings.gameplay_mode = 'standard'
+                          OR guild_settings.shoe_channel_id != excluded.shoe_channel_id
+                        THEN NULL
+                        ELSE guild_settings.last_contributor_user_id
+                    END,
                     shoe_channel_id = excluded.shoe_channel_id
                 """,
                 (guild, channel),
@@ -172,14 +640,15 @@ class ShoeDatabase:
             try:
                 row = self._connection.execute(
                     """
-                    SELECT shoe_channel_id, total_shoes, current_streak, best_streak
+                    SELECT shoe_channel_id, total_shoes, current_streak, best_streak,
+                           matching_mode, gameplay_mode
                     FROM guild_settings
                     WHERE guild_id = ?
                     """,
                     (guild,),
                 ).fetchone()
             except sqlite3.Error as exc:
-                raise DatabaseError("Could not read guild statistics") from exc
+                raise DatabaseError("Could not read server statistics") from exc
 
         if row is None:
             return None
@@ -188,23 +657,40 @@ class ShoeDatabase:
             total_shoes=int(row["total_shoes"]),
             current_streak=int(row["current_streak"]),
             best_streak=int(row["best_streak"]),
+            matching_mode=self._matching_mode(str(row["matching_mode"])),
+            gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
         )
 
     def record_message(
         self,
         guild_id: int | str,
         user_id: int | str | None,
-        is_valid: bool,
+        content_matches: bool | None = None,
+        *,
+        is_valid: bool | None = None,
     ) -> MessageUpdate:
+        """Apply one message under the server's current gameplay mode.
+
+        ``is_valid`` remains as a keyword alias for callers from the original
+        release. It means that the content matched; Relay can still reject it.
+        """
+        if content_matches is None:
+            if is_valid is None:
+                raise ValueError("content_matches is required")
+            content_matches = is_valid
+        elif is_valid is not None:
+            raise ValueError("provide content_matches or is_valid, not both")
+
         guild = self._snowflake(guild_id, "guild_id")
-        user = self._snowflake(user_id, "user_id") if is_valid and user_id else None
-        if is_valid and user is None:
-            raise ValueError("user_id is required for a valid Shoe message")
+        user = self._snowflake(user_id, "user_id") if content_matches and user_id else None
+        if content_matches and user is None:
+            raise ValueError("user_id is required when message content matches")
 
         with self._write_transaction() as connection:
             row = connection.execute(
                 """
-                SELECT total_shoes, current_streak, best_streak
+                SELECT total_shoes, current_streak, best_streak,
+                       gameplay_mode, last_contributor_user_id
                 FROM guild_settings
                 WHERE guild_id = ?
                 """,
@@ -214,20 +700,30 @@ class ShoeDatabase:
                 raise GuildNotConfigured("This server has not configured Shoe Bot")
 
             previous_streak = int(row["current_streak"])
-            if is_valid:
+            gameplay_mode = self._gameplay_mode(str(row["gameplay_mode"]))
+            last_contributor = row["last_contributor_user_id"]
+            relay_repeat = bool(
+                content_matches
+                and gameplay_mode == "relay"
+                and previous_streak > 0
+                and last_contributor == user
+            )
+            accepted = bool(content_matches and not relay_repeat)
+            break_reason: BreakReason | None = None
+            hall_rank: int | None = None
+
+            if accepted:
+                next_contributor = user if gameplay_mode == "relay" else None
                 connection.execute(
                     """
                     UPDATE guild_settings
                     SET total_shoes = total_shoes + 1,
                         current_streak = current_streak + 1,
-                        best_streak = CASE
-                            WHEN current_streak + 1 > best_streak
-                            THEN current_streak + 1
-                            ELSE best_streak
-                        END
+                        best_streak = MAX(best_streak, current_streak + 1),
+                        last_contributor_user_id = ?
                     WHERE guild_id = ?
                     """,
-                    (guild,),
+                    (next_contributor, guild),
                 )
                 connection.execute(
                     """
@@ -239,14 +735,20 @@ class ShoeDatabase:
                     (guild, user),
                 )
             else:
+                break_reason = "relay" if relay_repeat else "invalid"
                 connection.execute(
                     """
                     UPDATE guild_settings
-                    SET current_streak = 0
+                    SET current_streak = 0,
+                        last_contributor_user_id = NULL
                     WHERE guild_id = ?
                     """,
                     (guild,),
                 )
+                if previous_streak > 0:
+                    hall_rank = self._record_completed_streak(
+                        connection, guild, previous_streak
+                    )
 
             updated = connection.execute(
                 """
@@ -262,11 +764,12 @@ class ShoeDatabase:
             current_streak=int(updated["current_streak"]),
             best_streak=int(updated["best_streak"]),
             previous_streak=previous_streak,
+            accepted=accepted,
+            break_reason=break_reason,
+            hall_of_fame_rank=hall_rank,
         )
 
-    def get_user_stats(
-        self, guild_id: int | str, user_id: int | str
-    ) -> UserStats:
+    def get_user_stats(self, guild_id: int | str, user_id: int | str) -> UserStats:
         guild = self._snowflake(guild_id, "guild_id")
         user = self._snowflake(user_id, "user_id")
         with self._lock:
@@ -282,8 +785,7 @@ class ShoeDatabase:
                               AND higher_user.shoe_count > current_user.shoe_count
                         ) AS leaderboard_rank
                     FROM user_stats AS current_user
-                    WHERE current_user.guild_id = ?
-                      AND current_user.user_id = ?
+                    WHERE current_user.guild_id = ? AND current_user.user_id = ?
                     """,
                     (guild, user),
                 ).fetchone()
@@ -292,10 +794,7 @@ class ShoeDatabase:
 
         if row is None:
             return UserStats(shoe_count=0, rank=None)
-        return UserStats(
-            shoe_count=int(row["shoe_count"]),
-            rank=int(row["leaderboard_rank"]),
-        )
+        return UserStats(int(row["shoe_count"]), int(row["leaderboard_rank"]))
 
     def get_leaderboard(
         self, guild_id: int | str, limit: int = 10
@@ -303,20 +802,17 @@ class ShoeDatabase:
         guild = self._snowflake(guild_id, "guild_id")
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
-
         with self._lock:
             try:
                 rows = self._connection.execute(
                     """
                     WITH ranked_users AS (
-                        SELECT
-                            user_id,
-                            shoe_count,
-                            RANK() OVER (ORDER BY shoe_count DESC) AS leaderboard_rank
+                        SELECT user_id, shoe_count,
+                               RANK() OVER (ORDER BY shoe_count DESC) AS rank
                         FROM user_stats
                         WHERE guild_id = ?
                     )
-                    SELECT user_id, shoe_count, leaderboard_rank
+                    SELECT user_id, shoe_count, rank
                     FROM ranked_users
                     ORDER BY shoe_count DESC, user_id ASC
                     LIMIT ?
@@ -325,17 +821,45 @@ class ShoeDatabase:
                 ).fetchall()
             except sqlite3.Error as exc:
                 raise DatabaseError("Could not read the leaderboard") from exc
-
         return [
-            LeaderboardEntry(
-                user_id=int(row["user_id"]),
-                shoe_count=int(row["shoe_count"]),
-                rank=int(row["leaderboard_rank"]),
-            )
+            LeaderboardEntry(int(row["user_id"]), int(row["shoe_count"]), int(row["rank"]))
             for row in rows
         ]
 
+    def get_hall_of_fame(
+        self, guild_id: int | str, limit: int = 10
+    ) -> list[HallOfFameEntry]:
+        guild = self._snowflake(guild_id, "guild_id")
+        if limit < 1 or limit > 10:
+            raise ValueError("limit must be between 1 and 10")
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT streak_length, completed_at, is_legacy
+                    FROM hall_of_fame
+                    WHERE guild_id = ?
+                    ORDER BY streak_length DESC
+                    LIMIT ?
+                    """,
+                    (guild, limit),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise DatabaseError("Could not read the Hall of Fame") from exc
+        return [
+            HallOfFameEntry(
+                rank=index,
+                streak_length=int(row["streak_length"]),
+                completed_at=(
+                    int(row["completed_at"]) if row["completed_at"] is not None else None
+                ),
+                is_legacy=bool(row["is_legacy"]),
+            )
+            for index, row in enumerate(rows, start=1)
+        ]
+
     def reset_guild_stats(self, guild_id: int | str) -> None:
+        """Delete all counts while preserving the selected channel and modes."""
         guild = self._snowflake(guild_id, "guild_id")
         with self._write_transaction() as connection:
             cursor = connection.execute(
@@ -343,54 +867,120 @@ class ShoeDatabase:
                 UPDATE guild_settings
                 SET total_shoes = 0,
                     current_streak = 0,
-                    best_streak = 0
+                    best_streak = 0,
+                    last_contributor_user_id = NULL
                 WHERE guild_id = ?
                 """,
                 (guild,),
             )
             if cursor.rowcount == 0:
                 raise GuildNotConfigured("This server has not configured Shoe Bot")
-            connection.execute(
-                "DELETE FROM user_stats WHERE guild_id = ?",
-                (guild,),
-            )
+            connection.execute("DELETE FROM user_stats WHERE guild_id = ?", (guild,))
+            connection.execute("DELETE FROM hall_of_fame WHERE guild_id = ?", (guild,))
+        self._checkpoint_after_deletion()
 
-    def delete_user_stats(
-        self, guild_id: int | str, user_id: int | str
-    ) -> bool:
-        """Delete one user's leaderboard row without changing aggregates."""
+    def delete_user_stats(self, guild_id: int | str, user_id: int | str) -> UserDeletion:
+        """Delete one user's row and any Relay-state reference to that user.
+
+        If that user is the current Relay contributor, the active streak is
+        ended so deleting the identifier cannot be used to bypass alternation.
+        Historical totals and the best streak remain aggregate statistics.
+        """
         guild = self._snowflake(guild_id, "guild_id")
         user = self._snowflake(user_id, "user_id")
         with self._write_transaction() as connection:
-            cursor = connection.execute(
+            row = connection.execute(
                 """
-                DELETE FROM user_stats
-                WHERE guild_id = ? AND user_id = ?
+                SELECT current_streak, gameplay_mode, last_contributor_user_id
+                FROM guild_settings WHERE guild_id = ?
                 """,
+                (guild,),
+            ).fetchone()
+            ended_streak = 0
+            if (
+                row is not None
+                and row["gameplay_mode"] == "relay"
+                and row["last_contributor_user_id"] == user
+            ):
+                ended_streak = int(row["current_streak"])
+                self._record_completed_streak(connection, guild, ended_streak)
+                connection.execute(
+                    """
+                    UPDATE guild_settings
+                    SET current_streak = 0, last_contributor_user_id = NULL
+                    WHERE guild_id = ?
+                    """,
+                    (guild,),
+                )
+            cursor = connection.execute(
+                "DELETE FROM user_stats WHERE guild_id = ? AND user_id = ?",
                 (guild, user),
             )
-        return cursor.rowcount > 0
+        self._checkpoint_after_deletion()
+        return UserDeletion(cursor.rowcount > 0, ended_streak)
 
     def delete_guild(self, guild_id: int | str) -> None:
-        """Delete all persisted configuration and statistics for one guild."""
         guild = self._snowflake(guild_id, "guild_id")
         with self._write_transaction() as connection:
-            # ON DELETE CASCADE removes this guild's user_stats rows.
-            connection.execute(
-                "DELETE FROM guild_settings WHERE guild_id = ?",
-                (guild,),
-            )
+            connection.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild,))
+        self._checkpoint_after_deletion()
 
-    def close(self) -> None:
+    def _close_connection(self) -> None:
         with self._lock:
             if self._closed:
                 return
             try:
-                self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                result = self._connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if result is not None and int(result[0]) != 0:
+                    LOGGER.warning("SQLite WAL checkpoint remained busy at shutdown")
             except sqlite3.Error:
-                # A future open will recover/checkpoint a valid WAL. Shutdown
-                # should still close the handle and allow Discord to exit.
                 pass
             finally:
                 self._connection.close()
                 self._closed = True
+
+    async def _aclose_impl(self, close_future) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.shield(asyncio.wrap_future(close_future, loop=loop))
+        finally:
+            with self._executor_state_lock:
+                if not self._executor_closed:
+                    self._executor.shutdown(wait=True, cancel_futures=False)
+                    self._executor_closed = True
+
+    async def aclose(self) -> None:
+        """Drain the ordered worker, checkpoint, and close without blocking Discord."""
+        if self._aclose_task is None:
+            with self._executor_state_lock:
+                if self._executor_closed:
+                    return
+                self._closing = True
+                if self._close_future is None:
+                    self._close_future = self._executor.submit(
+                        self._close_connection
+                    )
+                close_future = self._close_future
+            self._aclose_task = asyncio.create_task(
+                self._aclose_impl(close_future)
+            )
+        await asyncio.shield(self._aclose_task)
+
+    def close(self) -> None:
+        """Synchronous shutdown for scripts and tests outside Discord's loop."""
+        with self._executor_state_lock:
+            if self._executor_closed:
+                return
+            self._closing = True
+            if self._close_future is None:
+                self._close_future = self._executor.submit(self._close_connection)
+            future = self._close_future
+        try:
+            future.result()
+        finally:
+            with self._executor_state_lock:
+                if not self._executor_closed:
+                    self._executor.shutdown(wait=True, cancel_futures=False)
+                    self._executor_closed = True
