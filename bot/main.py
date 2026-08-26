@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import sys
 
 import discord
 from discord import app_commands
@@ -172,6 +173,7 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
     )
     # Never enable Discord gateway DEBUG logging: raw gateway payloads can
     # contain message content. WARNING keeps operational errors without payloads.
