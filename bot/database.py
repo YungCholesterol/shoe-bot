@@ -44,6 +44,11 @@ class GuildConfig:
     random_shoe_enabled: bool = False
     random_shoe_channel_ids: tuple[int, ...] = ()
     random_shoe_next_at: int | None = None
+    random_shoe_min_minutes: int = 50
+    random_shoe_max_minutes: int = 103
+    quiet_start_hour: int | None = None
+    quiet_end_hour: int | None = None
+    log_channel_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +61,11 @@ class GuildStats:
     gameplay_mode: GameplayMode
     random_shoe_enabled: bool = False
     random_shoe_channel_ids: tuple[int, ...] = ()
+    random_shoe_min_minutes: int = 50
+    random_shoe_max_minutes: int = 103
+    quiet_start_hour: int | None = None
+    quiet_end_hour: int | None = None
+    log_channel_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +201,7 @@ class ShoeDatabase:
             user_version = int(
                 self._connection.execute("PRAGMA user_version").fetchone()[0]
             )
-            if user_version > 3:
+            if user_version > 4:
                 raise sqlite3.DatabaseError(
                     "Database schema is newer than this Shoe Bot release"
                 )
@@ -318,11 +328,32 @@ class ShoeDatabase:
                     guild_id TEXT PRIMARY KEY NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
                     next_send_at INTEGER,
+                    min_minutes INTEGER NOT NULL DEFAULT 50 CHECK (min_minutes BETWEEN 5 AND 1440),
+                    max_minutes INTEGER NOT NULL DEFAULT 103 CHECK (max_minutes BETWEEN min_minutes AND 1440),
+                    quiet_start_hour INTEGER CHECK (quiet_start_hour BETWEEN 0 AND 23),
+                    quiet_end_hour INTEGER CHECK (quiet_end_hour BETWEEN 0 AND 23),
+                    log_channel_id TEXT,
                     FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id)
                         ON DELETE CASCADE
                 ) WITHOUT ROWID
                 """
             )
+            random_columns = {
+                str(row["name"]) for row in self._connection.execute(
+                    "PRAGMA table_info(random_shoe_settings)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "min_minutes": "INTEGER NOT NULL DEFAULT 50 CHECK (min_minutes BETWEEN 5 AND 1440)",
+                "max_minutes": "INTEGER NOT NULL DEFAULT 103 CHECK (max_minutes BETWEEN min_minutes AND 1440)",
+                "quiet_start_hour": "INTEGER CHECK (quiet_start_hour BETWEEN 0 AND 23)",
+                "quiet_end_hour": "INTEGER CHECK (quiet_end_hour BETWEEN 0 AND 23)",
+                "log_channel_id": "TEXT",
+            }.items():
+                if column not in random_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE random_shoe_settings ADD COLUMN {column} {definition}"
+                    )
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS random_shoe_channels (
@@ -389,7 +420,7 @@ class ShoeDatabase:
             self._connection.execute(
                 """
                 INSERT INTO schema_metadata (metadata_key, metadata_value)
-                VALUES ('schema_version', '3')
+                VALUES ('schema_version', '4')
                 ON CONFLICT (metadata_key) DO UPDATE SET
                     metadata_value = excluded.metadata_value
                 """
@@ -401,7 +432,7 @@ class ShoeDatabase:
                 raise sqlite3.DatabaseError(
                     "Database foreign-key integrity check failed"
                 )
-            self._connection.execute("PRAGMA user_version = 3")
+            self._connection.execute("PRAGMA user_version = 4")
             self._connection.execute("COMMIT")
         except Exception:
             self._rollback_without_masking_error()
@@ -551,7 +582,9 @@ class ShoeDatabase:
                     """
                     SELECT g.guild_id, g.shoe_channel_id, g.matching_mode,
                            g.gameplay_mode, COALESCE(r.enabled, 0) AS random_enabled,
-                           r.next_send_at
+                           r.next_send_at, COALESCE(r.min_minutes, 50) AS min_minutes,
+                           COALESCE(r.max_minutes, 103) AS max_minutes,
+                           r.quiet_start_hour, r.quiet_end_hour, r.log_channel_id
                     FROM guild_settings AS g
                     LEFT JOIN random_shoe_settings AS r ON r.guild_id = g.guild_id
                     """
@@ -565,6 +598,11 @@ class ShoeDatabase:
                 gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
                 random_shoe_enabled=bool(row["random_enabled"]),
                 random_shoe_next_at=(int(row["next_send_at"]) if row["next_send_at"] is not None else None),
+                random_shoe_min_minutes=int(row["min_minutes"]),
+                random_shoe_max_minutes=int(row["max_minutes"]),
+                quiet_start_hour=(int(row["quiet_start_hour"]) if row["quiet_start_hour"] is not None else None),
+                quiet_end_hour=(int(row["quiet_end_hour"]) if row["quiet_end_hour"] is not None else None),
+                log_channel_id=(int(row["log_channel_id"]) if row["log_channel_id"] is not None else None),
             )
             for row in rows
         }
@@ -578,25 +616,37 @@ class ShoeDatabase:
             guild_id: GuildConfig(
                 config.channel_id, config.matching_mode, config.gameplay_mode,
                 config.random_shoe_enabled, tuple(channels.get(guild_id, ())),
-                config.random_shoe_next_at,
+                config.random_shoe_next_at, config.random_shoe_min_minutes,
+                config.random_shoe_max_minutes, config.quiet_start_hour,
+                config.quiet_end_hour, config.log_channel_id,
             ) for guild_id, config in configs.items()
         }
 
     def configure_random_shoe(
         self, guild_id: int | str, enabled: bool,
         channel_ids: Sequence[int | str], next_send_at: int | None,
+        min_minutes: int = 50, max_minutes: int = 103,
+        quiet_start_hour: int | None = None, quiet_end_hour: int | None = None,
+        log_channel_id: int | str | None = None,
     ) -> None:
         guild = self._snowflake(guild_id, "guild_id")
         channels = tuple(dict.fromkeys(self._snowflake(c, "channel_id") for c in channel_ids))
         if enabled and not channels:
             raise ValueError("at least one channel is required when enabled")
+        if enabled and log_channel_id is None:
+            raise ValueError("a log channel is required when enabled")
+        if not 5 <= min_minutes <= max_minutes <= 1440:
+            raise ValueError("timing must satisfy 5 <= minimum <= maximum <= 1440")
+        if (quiet_start_hour is None) != (quiet_end_hour is None):
+            raise ValueError("quiet hours require both a start and end")
+        log_channel = self._snowflake(log_channel_id, "log_channel_id") if log_channel_id is not None else None
         with self._write_transaction() as connection:
             if connection.execute("SELECT 1 FROM guild_settings WHERE guild_id = ?", (guild,)).fetchone() is None:
                 raise GuildNotConfigured("server is not configured")
             connection.execute(
-                "INSERT INTO random_shoe_settings (guild_id, enabled, next_send_at) VALUES (?, ?, ?) "
-                "ON CONFLICT (guild_id) DO UPDATE SET enabled=excluded.enabled, next_send_at=excluded.next_send_at",
-                (guild, int(enabled), next_send_at),
+                "INSERT INTO random_shoe_settings (guild_id, enabled, next_send_at, min_minutes, max_minutes, quiet_start_hour, quiet_end_hour, log_channel_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE SET enabled=excluded.enabled, next_send_at=excluded.next_send_at, min_minutes=excluded.min_minutes, max_minutes=excluded.max_minutes, quiet_start_hour=excluded.quiet_start_hour, quiet_end_hour=excluded.quiet_end_hour, log_channel_id=excluded.log_channel_id",
+                (guild, int(enabled), next_send_at, min_minutes, max_minutes, quiet_start_hour, quiet_end_hour, log_channel),
             )
             connection.execute("DELETE FROM random_shoe_channels WHERE guild_id = ?", (guild,))
             connection.executemany(
@@ -739,7 +789,10 @@ class ShoeDatabase:
                     """
                     SELECT g.shoe_channel_id, g.total_shoes, g.current_streak,
                            g.best_streak, g.matching_mode, g.gameplay_mode,
-                           COALESCE(r.enabled, 0) AS random_enabled
+                           COALESCE(r.enabled, 0) AS random_enabled,
+                           COALESCE(r.min_minutes, 50) AS min_minutes,
+                           COALESCE(r.max_minutes, 103) AS max_minutes,
+                           r.quiet_start_hour, r.quiet_end_hour, r.log_channel_id
                     FROM guild_settings AS g
                     LEFT JOIN random_shoe_settings AS r ON r.guild_id = g.guild_id
                     WHERE g.guild_id = ?
@@ -764,6 +817,11 @@ class ShoeDatabase:
             gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
             random_shoe_enabled=bool(row["random_enabled"]),
             random_shoe_channel_ids=tuple(int(item["channel_id"]) for item in channels),
+            random_shoe_min_minutes=int(row["min_minutes"]),
+            random_shoe_max_minutes=int(row["max_minutes"]),
+            quiet_start_hour=(int(row["quiet_start_hour"]) if row["quiet_start_hour"] is not None else None),
+            quiet_end_hour=(int(row["quiet_end_hour"]) if row["quiet_end_hour"] is not None else None),
+            log_channel_id=(int(row["log_channel_id"]) if row["log_channel_id"] is not None else None),
         )
 
     def record_message(

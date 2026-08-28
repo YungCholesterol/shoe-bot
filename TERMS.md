@@ -53,6 +53,12 @@ channels and sends `Shoe` with the bundled image at randomized intervals between
 50 and 103 minutes. Administrators are responsible for choosing appropriate
 channels and may disable the feature at any time.
 
+Administrators may configure a delay range from 5 minutes through 24 hours,
+set UTC quiet hours, send an immediate post from the settings panel, and select
+a private audit channel. Immediate posts are deliberate administrator actions
+and are not restricted by quiet hours. Administrators remain responsible for
+channel choice, frequency, and server-member expectations.
+
 The leaderboard ranks accepted personal contributions. `/profile` shows fixed
 milestones derived from a user's stored count. The Hall of Fame view inside
 `/leaderboard` shows the ten highest distinct completed streak lengths for that

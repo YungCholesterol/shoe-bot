@@ -475,11 +475,17 @@ class ShoeDatabaseTests(unittest.TestCase):
         self.assertFalse(config.random_shoe_enabled)
         self.assertEqual(config.random_shoe_channel_ids, ())
 
-        self.database.configure_random_shoe(100, True, (201, 202, 201), 123456)
+        self.database.configure_random_shoe(
+            100, True, (201, 202, 201), 123456,
+            30, 90, 23, 7, 299,
+        )
         config = self.database.load_guild_configs()[100]
         self.assertTrue(config.random_shoe_enabled)
         self.assertEqual(config.random_shoe_channel_ids, (201, 202))
         self.assertEqual(config.random_shoe_next_at, 123456)
+        self.assertEqual((config.random_shoe_min_minutes, config.random_shoe_max_minutes), (30, 90))
+        self.assertEqual((config.quiet_start_hour, config.quiet_end_hour), (23, 7))
+        self.assertEqual(config.log_channel_id, 299)
 
     def test_random_shoe_requires_a_channel_when_enabled(self) -> None:
         self.configure()

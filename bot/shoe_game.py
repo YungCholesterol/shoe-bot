@@ -182,7 +182,10 @@ class ShoeGame:
         )
 
     async def configure_random_shoe(
-        self, guild_id: int, enabled: bool, channel_ids: tuple[int, ...]
+        self, guild_id: int, enabled: bool, channel_ids: tuple[int, ...],
+        min_minutes: int = 50, max_minutes: int = 103,
+        quiet_start_hour: int | None = None, quiet_end_hour: int | None = None,
+        log_channel_id: int | None = None,
     ) -> None:
         async with self._state_lock:
             if self._closing:
@@ -194,6 +197,11 @@ class ShoeGame:
                     enabled,
                     channel_ids,
                     None,
+                    min_minutes,
+                    max_minutes,
+                    quiet_start_hour,
+                    quiet_end_hour,
+                    log_channel_id,
                 )
             )
             if cancellation is not None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import logging
+from pathlib import Path
+import random
 
 import discord
 from discord import app_commands
@@ -26,6 +28,7 @@ ACHIEVEMENT_THRESHOLDS = (1, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000)
 PRIVACY_URL = "https://github.com/YungCholesterol/shoe-bot/blob/main/PRIVACY.md"
 TERMS_URL = "https://github.com/YungCholesterol/shoe-bot/blob/main/TERMS.md"
 SUPPORT_EMAIL = "yungcholesterol@gmail.com"
+RANDOM_SHOE_IMAGE = Path(__file__).resolve().parents[1] / "assets" / "random-shoe-obama.jpg"
 REQUIRED_CHANNEL_PERMISSIONS = (
     ("view_channel", "View Channel"),
     ("send_messages", "Send Messages"),
@@ -350,7 +353,7 @@ def _settings_embed(
         value=(
             ("Enabled · " + (random_channels or "no channels selected"))
             if random_shoe_enabled else
-            "Off (default). Select channels and turn it on to post `Shoe` with the image every 50–103 minutes."
+            "Off (default). Select channels, choose `/shoelog`, optionally use `/shoetiming`, then turn it on."
         ),
         inline=False,
     )
@@ -383,6 +386,11 @@ class SetupWizardView(discord.ui.View):
         title: str,
         initial_random_shoe_enabled: bool = False,
         initial_random_shoe_channel_ids: Sequence[int] = (),
+        initial_random_shoe_min_minutes: int = 50,
+        initial_random_shoe_max_minutes: int = 103,
+        initial_quiet_start_hour: int | None = None,
+        initial_quiet_end_hour: int | None = None,
+        initial_log_channel_id: int | None = None,
         start_reset: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(timeout=180.0)
@@ -395,6 +403,11 @@ class SetupWizardView(discord.ui.View):
         self._gameplay_mode = initial_gameplay_mode
         self._random_shoe_enabled = initial_random_shoe_enabled
         self._random_shoe_channel_ids = tuple(initial_random_shoe_channel_ids)
+        self._random_shoe_min_minutes = initial_random_shoe_min_minutes
+        self._random_shoe_max_minutes = initial_random_shoe_max_minutes
+        self._quiet_start_hour = initial_quiet_start_hour
+        self._quiet_end_hour = initial_quiet_end_hour
+        self._log_channel_id = initial_log_channel_id
         self._is_current = is_current
         self._finished = finished
         self._title = title
@@ -570,9 +583,41 @@ class SetupWizardView(discord.ui.View):
             if self._consumed or not self._is_current():
                 await _private_error(interaction, "These settings are no longer valid.")
                 return
-            await interaction.edit_original_response(
-                embed=self.build_embed(),
-                view=self,
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Send Shoe now", style=discord.ButtonStyle.secondary, row=4)
+    async def send_shoe_now(
+        self, interaction: discord.Interaction, _button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer()
+        async with self._callback_lock:
+            if not self._random_shoe_channel_ids:
+                await _private_error(interaction, "Select at least one Random Shoe channel first.")
+                return
+            channels = [
+                channel for channel_id in self._random_shoe_channel_ids
+                if isinstance((channel := self._guild.get_channel(channel_id)), discord.TextChannel)
+            ]
+            if not channels:
+                await _private_error(interaction, "None of the selected Random Shoe channels are available.")
+                return
+            channel = random.choice(channels)
+            await channel.send(
+                "Shoe", file=discord.File(RANDOM_SHOE_IMAGE, filename="shoe.jpg"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log_channel = self._guild.get_channel(self._log_channel_id) if self._log_channel_id else None
+            if isinstance(log_channel, discord.TextChannel):
+                try:
+                    await log_channel.send(
+                        f"Shoe Bot audit · Manual Random Shoe sent in {channel.mention} by <@{self._requester_id}>.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    pass
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+            await interaction.followup.send(
+                f"Sent a Random Shoe post in {channel.mention}.", ephemeral=True
             )
 
     @discord.ui.select(
@@ -635,6 +680,9 @@ class SetupWizardView(discord.ui.View):
             if self._random_shoe_enabled and not self._random_shoe_channel_ids:
                 await _private_error(interaction, "Select at least one Random Shoe channel before turning it on.")
                 return
+            if self._random_shoe_enabled and self._log_channel_id is None:
+                await _private_error(interaction, "Choose an audit-log channel with `/shoelog` before turning Random Shoe posts on.")
+                return
             for random_channel_id in self._random_shoe_channel_ids:
                 random_channel = self._guild.get_channel(random_channel_id)
                 if not isinstance(random_channel, discord.TextChannel):
@@ -662,6 +710,11 @@ class SetupWizardView(discord.ui.View):
                     self._guild_id,
                     self._random_shoe_enabled,
                     tuple(self._random_shoe_channel_ids),
+                    self._random_shoe_min_minutes,
+                    self._random_shoe_max_minutes,
+                    self._quiet_start_hour,
+                    self._quiet_end_hour,
+                    self._log_channel_id,
                 )
                 self._saved = True
             except DatabaseError as exc:
@@ -724,8 +777,16 @@ class SetupWizardView(discord.ui.View):
                         "Could not send saved-settings fallback (%s)",
                         type(followup_exc).__name__,
                     )
+            log_channel = self._guild.get_channel(self._log_channel_id) if self._log_channel_id else None
+            if isinstance(log_channel, discord.TextChannel):
+                try:
+                    await log_channel.send(
+                        f"Shoe Bot audit · Settings saved by <@{self._requester_id}>.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except discord.HTTPException:
+                    pass
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
     async def cancel(
         self,
         interaction: discord.Interaction,
@@ -993,6 +1054,14 @@ class ShoeCommands(commands.Cog):
         self._pending_reset_tokens: dict[int, object] = {}
         self._pending_settings_tokens: dict[int, object] = {}
 
+    async def _audit(self, guild: discord.Guild, channel_id: int | None, text: str) -> None:
+        channel = guild.get_channel(channel_id) if channel_id is not None else None
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send("Shoe Bot audit · " + text, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as exc:
+                LOGGER.warning("Could not send Shoe Bot audit log (%s)", type(exc).__name__)
+
     async def _guild_stats_or_error(
         self, interaction: discord.Interaction
     ) -> GuildStats | None:
@@ -1050,6 +1119,11 @@ class ShoeCommands(commands.Cog):
                 initial_gameplay_mode=stats.gameplay_mode if stats else "relay",
                 initial_random_shoe_enabled=stats.random_shoe_enabled if stats else False,
                 initial_random_shoe_channel_ids=stats.random_shoe_channel_ids if stats else (),
+                initial_random_shoe_min_minutes=stats.random_shoe_min_minutes if stats else 50,
+                initial_random_shoe_max_minutes=stats.random_shoe_max_minutes if stats else 103,
+                initial_quiet_start_hour=stats.quiet_start_hour if stats else None,
+                initial_quiet_end_hour=stats.quiet_end_hour if stats else None,
+                initial_log_channel_id=stats.log_channel_id if stats else None,
                 is_current=is_current,
                 finished=finished,
                 title=title,
@@ -1144,6 +1218,80 @@ class ShoeCommands(commands.Cog):
                 title="Shoe Bot settings",
                 start_reset=self._open_reset_confirmation,
             )
+
+    @app_commands.command(name="shoelog", description="Choose the private Shoe Bot audit-log channel")
+    @app_commands.describe(channel="Channel for settings changes and scheduler notices")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shoelog(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        stats = await self._guild_stats_or_error(interaction)
+        if stats is None or interaction.guild is None:
+            return
+        await self._game.configure_random_shoe(
+            interaction.guild.id, stats.random_shoe_enabled,
+            stats.random_shoe_channel_ids, stats.random_shoe_min_minutes,
+            stats.random_shoe_max_minutes, stats.quiet_start_hour,
+            stats.quiet_end_hour, channel.id,
+        )
+        await self._audit(interaction.guild, channel.id, f"Audit channel selected by <@{interaction.user.id}>.")
+        await _respond(interaction, f"Shoe Bot audit logs will be sent to {channel.mention}.")
+
+    @app_commands.command(name="shoetiming", description="Set Random Shoe timing and optional UTC quiet hours")
+    @app_commands.describe(
+        minimum_minutes="Minimum delay (5–1440 minutes)",
+        maximum_minutes="Maximum delay (minimum–1440 minutes)",
+        quiet_start_utc="Quiet-hour start, 0–23 UTC; omit both to disable",
+        quiet_end_utc="Quiet-hour end, 0–23 UTC; omit both to disable",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def shoetiming(
+        self, interaction: discord.Interaction,
+        minimum_minutes: app_commands.Range[int, 5, 1440],
+        maximum_minutes: app_commands.Range[int, 5, 1440],
+        quiet_start_utc: app_commands.Range[int, 0, 23] | None = None,
+        quiet_end_utc: app_commands.Range[int, 0, 23] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        stats = await self._guild_stats_or_error(interaction)
+        if stats is None or interaction.guild is None:
+            return
+        if minimum_minutes > maximum_minutes or ((quiet_start_utc is None) != (quiet_end_utc is None)):
+            await _private_error(interaction, "Minimum must not exceed maximum, and quiet hours need both a start and end.")
+            return
+        await self._game.configure_random_shoe(
+            interaction.guild.id, stats.random_shoe_enabled,
+            stats.random_shoe_channel_ids, minimum_minutes, maximum_minutes,
+            quiet_start_utc, quiet_end_utc, stats.log_channel_id,
+        )
+        quiet = "off" if quiet_start_utc is None else f"{quiet_start_utc:02d}:00–{quiet_end_utc:02d}:00 UTC"
+        await self._audit(interaction.guild, stats.log_channel_id, f"Timing changed by <@{interaction.user.id}> to {minimum_minutes}–{maximum_minutes} minutes; quiet hours {quiet}.")
+        await _respond(interaction, f"Random Shoe timing saved: **{minimum_minutes}–{maximum_minutes} minutes**; quiet hours **{quiet}**.")
+
+    @app_commands.command(name="shoestatus", description="Check Shoe Bot health in this server")
+    @app_commands.guild_only()
+    async def shoestatus(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        stats = await self._guild_stats_or_error(interaction)
+        if stats is None:
+            return
+        image_ok = RANDOM_SHOE_IMAGE.is_file()
+        destinations_ok = bool(stats.random_shoe_channel_ids) if stats.random_shoe_enabled else True
+        logs_ok = stats.log_channel_id is not None if stats.random_shoe_enabled else True
+        healthy = image_ok and destinations_ok and logs_ok
+        embed = discord.Embed(title="Shoe Bot status", colour=discord.Colour.green() if healthy else discord.Colour.orange())
+        embed.description = "Healthy and ready." if healthy else "Needs administrator attention."
+        embed.add_field(name="Database", value="Connected")
+        embed.add_field(name="Image", value="Ready" if image_ok else "Missing")
+        embed.add_field(name="Random posts", value="Enabled" if stats.random_shoe_enabled else "Off")
+        embed.add_field(name="Timing", value=f"{stats.random_shoe_min_minutes}–{stats.random_shoe_max_minutes} minutes")
+        quiet = "Off" if stats.quiet_start_hour is None else f"{stats.quiet_start_hour:02d}:00–{stats.quiet_end_hour:02d}:00 UTC"
+        embed.add_field(name="Quiet hours", value=quiet)
+        embed.add_field(name="Audit log", value=f"<#{stats.log_channel_id}>" if stats.log_channel_id else "Not selected")
+        await _respond(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @app_commands.command(name="streak", description="Show this server's Shoe streak")
     @app_commands.guild_only()
@@ -1312,10 +1460,11 @@ class ShoeCommands(commands.Cog):
             name="Administrator commands",
             value=(
                 "`/setup` · `/shoesettings`\n"
+                "`/shoelog` · `/shoetiming` · `/shoestatus`\n"
                 "Settings includes permission diagnostics, the protected server reset, "
                 "and optional Random Shoe posts. When enabled, the bot chooses one of "
                 "the admin-selected channels and posts `Shoe` with the supplied image "
-                "after a fresh random delay of 50–103 minutes. It is off by default."
+                "after a fresh configurable random delay, with optional UTC quiet hours. It is off by default."
             ),
             inline=False,
         )

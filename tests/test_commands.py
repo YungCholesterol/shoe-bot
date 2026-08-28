@@ -124,6 +124,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                 "leaderboard",
                 "shoehelp",
                 "forgetme",
+                "shoelog",
+                "shoetiming",
+                "shoestatus",
             },
         )
         self.assertTrue(all(command.guild_only for command in commands.values()))
@@ -152,7 +155,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_mutating_admin_command_has_two_permission_layers(self) -> None:
         await self.bot.add_cog(ShoeCommands(self.database, self.bot.game))
         commands = {command.name: command for command in self.bot.tree.get_commands()}
-        admin_commands = {"setup", "shoesettings"}
+        admin_commands = {"setup", "shoesettings", "shoelog", "shoetiming"}
         for name in admin_commands:
             self.assertTrue(commands[name].default_permissions.administrator)
             self.assertGreaterEqual(len(commands[name].checks), 1)
@@ -881,7 +884,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             hall_of_fame=discord.Embed(title="Hall of Fame"),
         )
         for view, item in (
-            (settings, settings.cancel),
+            (settings, settings.recheck),
             (reset, reset.cancel),
             (leaderboard, leaderboard.contributors),
         ):
@@ -964,6 +967,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "/forgetme",
             "/setup",
             "/shoesettings",
+            "/shoelog",
+            "/shoetiming",
+            "/shoestatus",
         ):
             self.assertIn(command, rendered)
         for removed in (

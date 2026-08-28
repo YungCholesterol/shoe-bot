@@ -60,13 +60,24 @@ leaves the active streak unchanged.
 | `/forgetme` | Everyone | Delete the caller's stored user ID and personal count. |
 | `/setup` | Administrator | Walk through channel, matching, gameplay, and permission setup. |
 | `/shoesettings` | Administrator | Change settings, run diagnostics, or open the protected server reset. |
+| `/shoelog` | Administrator | Choose the private audit-log channel required for Random Shoe posts. |
+| `/shoetiming` | Administrator | Configure randomized timing and UTC quiet hours. |
+| `/shoestatus` | Everyone | Report bot and Random Shoe configuration health. |
 
-Both `/setup` and `/shoesettings` include **Random Shoe posts**, an optional
-feature that is off by default. An administrator may select one or more text
-channels and enable it. While enabled, the bot waits a newly randomized 50 to
-103 minutes, chooses one configured channel, and sends `Shoe` with the bundled
-image. With one selected channel, every post goes there. The original image is
-stored and sent without resizing or recompression.
+## Random Shoe posts
+
+Random Shoe posts are a first-class optional feature and remain **off by
+default**. Administrators can select one or more destinations in `/setup` or
+`/shoesettings`, toggle scheduling, use `/shoetiming` for a randomized 5-minute
+to 24-hour range and UTC quiet hours, and use `/shoelog` to choose the required
+private audit channel. **Send Shoe now** posts immediately to one random
+eligible channel. `/shoestatus` reports database, image, timing, quiet-hours,
+destination, and audit-log health.
+
+Each scheduled cycle draws a fresh delay and eligible channel, then sends
+`Shoe` with the bundled image. Quiet hours postpone delivery. With one selected
+channel every post goes there. The original image is stored and sent without
+resizing or recompression.
 
 The reset control inside `/shoesettings` atomically deletes the server's total,
 current and best streaks, personal counts, Hall of Fame records, and Relay

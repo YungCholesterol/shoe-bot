@@ -53,7 +53,7 @@ therefore never retroactively change counters.
 | --- | --- | --- |
 | Discord server ID and configured channel ID | Keep each server's game separate and route new events | Until the bot is removed from the server |
 | Matching mode and gameplay mode | Apply that server's selected rules | Until changed or the bot is removed |
-| Random Shoe enabled state, selected channel IDs, and next scheduled time | Deliver the optional administrator-configured Random Shoe posts and resume timing after restarts | Until changed or the bot is removed |
+| Random Shoe enabled state, destination and audit-log channel IDs, timing range, UTC quiet hours, and next scheduled time | Deliver and audit optional administrator-configured Random Shoe posts and resume timing after restarts | Until changed or the bot is removed |
 | Global total, current streak, and best streak | Provide server statistics | Until the reset control in `/shoesettings` is confirmed or the bot is removed |
 | Discord user ID and accepted-message count | Personal statistics, milestones, and leaderboard ranking | Until `/forgetme`, a confirmed server reset, or removal |
 | Last accepted contributor's Discord user ID in an active Relay | Enforce different consecutive contributors across messages and restarts | Until the streak ends, relevant settings change, `/forgetme`, a confirmed server reset, or removal |
