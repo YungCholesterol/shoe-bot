@@ -112,7 +112,7 @@ app or individual commands in Discord's integration settings.
 
 The bot does not need to manage channels, messages, roles, or members. For the
 smallest transient data scope, deny the bot role **View Channel** everywhere
-except the dedicated game channel.
+except the dedicated game channels.
 
 ## Message Content Intent
 
