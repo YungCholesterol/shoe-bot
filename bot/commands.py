@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import logging
 from pathlib import Path
-import random
 
 import discord
 from discord import app_commands
@@ -585,41 +584,6 @@ class SetupWizardView(discord.ui.View):
                 return
             await interaction.edit_original_response(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Send Shoe now", style=discord.ButtonStyle.secondary, row=4)
-    async def send_shoe_now(
-        self, interaction: discord.Interaction, _button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.defer()
-        async with self._callback_lock:
-            if not self._random_shoe_channel_ids:
-                await _private_error(interaction, "Select at least one Random Shoe channel first.")
-                return
-            channels = [
-                channel for channel_id in self._random_shoe_channel_ids
-                if isinstance((channel := self._guild.get_channel(channel_id)), discord.TextChannel)
-            ]
-            if not channels:
-                await _private_error(interaction, "None of the selected Random Shoe channels are available.")
-                return
-            channel = random.choice(channels)
-            await channel.send(
-                "Shoe", file=discord.File(RANDOM_SHOE_IMAGE, filename="shoe.jpg"),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            log_channel = self._guild.get_channel(self._log_channel_id) if self._log_channel_id else None
-            if isinstance(log_channel, discord.TextChannel):
-                try:
-                    await log_channel.send(
-                        f"Shoe Bot audit · Manual Random Shoe sent in {channel.mention} by <@{self._requester_id}>.",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                except discord.HTTPException:
-                    pass
-            await interaction.edit_original_response(embed=self.build_embed(), view=self)
-            await interaction.followup.send(
-                f"Sent a Random Shoe post in {channel.mention}.", ephemeral=True
-            )
-
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[discord.ChannelType.text],
@@ -787,6 +751,7 @@ class SetupWizardView(discord.ui.View):
                 except discord.HTTPException:
                     pass
 
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
     async def cancel(
         self,
         interaction: discord.Interaction,
@@ -1293,6 +1258,56 @@ class ShoeCommands(commands.Cog):
         embed.add_field(name="Audit log", value=f"<#{stats.log_channel_id}>" if stats.log_channel_id else "Not selected")
         await _respond(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
+    @app_commands.command(name="forceshoe", description="Immediately send one Shoe post to a selected channel")
+    @app_commands.describe(channel="The single text channel that should receive the Shoe post")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def forceshoe(
+        self, interaction: discord.Interaction, channel: discord.TextChannel,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild is None:
+            await _private_error(interaction, "This command can only be used in a server.")
+            return
+        missing = _missing_permissions(interaction.guild, channel)
+        bot_member = interaction.guild.me
+        if bot_member is None or not channel.permissions_for(bot_member).attach_files:
+            missing.append("Attach Files")
+        if missing:
+            await _private_error(
+                interaction,
+                f"I cannot send the Shoe post in {channel.mention}. Missing: " + ", ".join(missing),
+            )
+            return
+        try:
+            await channel.send(
+                "Shoe",
+                file=discord.File(RANDOM_SHOE_IMAGE, filename="shoe.jpg"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            LOGGER.warning("Could not force a Shoe post (%s)", type(exc).__name__)
+            await _private_error(interaction, "I could not send the Shoe post in that channel.")
+            return
+
+        try:
+            stats = await self._database.run(
+                self._database.get_guild_stats, interaction.guild.id
+            )
+        except DatabaseError:
+            stats = None
+        if stats is not None:
+            await self._audit(
+                interaction.guild,
+                stats.log_channel_id,
+                f"`/forceshoe` sent in {channel.mention} by <@{interaction.user.id}>.",
+            )
+        await _respond(
+            interaction,
+            f"Sent `Shoe` with the image in {channel.mention}. The automatic timer was not changed.",
+        )
+
     @app_commands.command(name="streak", description="Show this server's Shoe streak")
     @app_commands.guild_only()
     async def streak(self, interaction: discord.Interaction) -> None:
@@ -1460,7 +1475,7 @@ class ShoeCommands(commands.Cog):
             name="Administrator commands",
             value=(
                 "`/setup` · `/shoesettings`\n"
-                "`/shoelog` · `/shoetiming` · `/shoestatus`\n"
+                "`/shoelog` · `/shoetiming` · `/shoestatus` · `/forceshoe`\n"
                 "Settings includes permission diagnostics, the protected server reset, "
                 "and optional Random Shoe posts. When enabled, the bot chooses one of "
                 "the admin-selected channels and posts `Shoe` with the supplied image "

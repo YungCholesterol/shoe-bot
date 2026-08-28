@@ -54,8 +54,9 @@ channels and sends `Shoe` with the bundled image at randomized intervals between
 channels and may disable the feature at any time.
 
 Administrators may configure a delay range from 5 minutes through 24 hours,
-set UTC quiet hours, send an immediate post from the settings panel, and select
-a private audit channel. Immediate posts are deliberate administrator actions
+set UTC quiet hours, use `/forceshoe` to send an immediate post to one selected
+channel, and select a private audit channel. Forced posts work independently of
+scheduled-post settings and do not reset the timer. They are deliberate administrator actions
 and are not restricted by quiet hours. Administrators remain responsible for
 channel choice, frequency, and server-member expectations.
 

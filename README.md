@@ -63,6 +63,7 @@ leaves the active streak unchanged.
 | `/shoelog` | Administrator | Choose the private audit-log channel required for Random Shoe posts. |
 | `/shoetiming` | Administrator | Configure randomized timing and UTC quiet hours. |
 | `/shoestatus` | Everyone | Report bot and Random Shoe configuration health. |
+| `/forceshoe channel:#channel` | Administrator | Immediately send one Shoe post to exactly the selected channel without changing the timer. |
 
 ## Random Shoe posts
 
@@ -70,8 +71,9 @@ Random Shoe posts are a first-class optional feature and remain **off by
 default**. Administrators can select one or more destinations in `/setup` or
 `/shoesettings`, toggle scheduling, use `/shoetiming` for a randomized 5-minute
 to 24-hour range and UTC quiet hours, and use `/shoelog` to choose the required
-private audit channel. **Send Shoe now** posts immediately to one random
-eligible channel. `/shoestatus` reports database, image, timing, quiet-hours,
+private audit channel. `/forceshoe` posts immediately to the one channel chosen
+for that command, even when scheduled posts are off or unconfigured, without
+resetting the timer. `/shoestatus` reports database, image, timing, quiet-hours,
 destination, and audit-log health.
 
 Each scheduled cycle draws a fresh delay and eligible channel, then sends

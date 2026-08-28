@@ -127,6 +127,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                 "shoelog",
                 "shoetiming",
                 "shoestatus",
+                "forceshoe",
             },
         )
         self.assertTrue(all(command.guild_only for command in commands.values()))
@@ -155,7 +156,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_mutating_admin_command_has_two_permission_layers(self) -> None:
         await self.bot.add_cog(ShoeCommands(self.database, self.bot.game))
         commands = {command.name: command for command in self.bot.tree.get_commands()}
-        admin_commands = {"setup", "shoesettings", "shoelog", "shoetiming"}
+        admin_commands = {"setup", "shoesettings", "shoelog", "shoetiming", "forceshoe"}
         for name in admin_commands:
             self.assertTrue(commands[name].default_permissions.administrator)
             self.assertGreaterEqual(len(commands[name].checks), 1)
@@ -970,6 +971,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "/shoelog",
             "/shoetiming",
             "/shoestatus",
+            "/forceshoe",
         ):
             self.assertIn(command, rendered)
         for removed in (
