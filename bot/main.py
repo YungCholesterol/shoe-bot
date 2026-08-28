@@ -97,7 +97,7 @@ class ShoeBot(commands.Bot):
         self.game = ShoeGame(database)
         self.tree.on_error = self.on_app_command_error
         self._random_shoe_task: asyncio.Task[None] | None = None
-        self._guild_commands_synced = False
+        self._guild_commands_cleaned = False
 
     @staticmethod
     def _next_random_shoe_at(min_minutes: int = 50, max_minutes: int = 103) -> int:
@@ -183,22 +183,25 @@ class ShoeBot(commands.Bot):
             LOGGER.error("Could not sync application commands (%s)", type(exc).__name__)
 
     async def on_ready(self) -> None:
-        if not self._guild_commands_synced:
-            synced_guilds = 0
+        if not self._guild_commands_cleaned:
+            cleaned_guilds = 0
             for installed_guild in self.guilds:
                 try:
                     target = discord.Object(id=installed_guild.id)
-                    self.tree.copy_global_to(guild=target)
+                    self.tree.clear_commands(guild=target)
                     await self.tree.sync(guild=target)
-                    synced_guilds += 1
+                    cleaned_guilds += 1
                 except discord.HTTPException as exc:
                     LOGGER.error(
-                        "Could not sync commands to server %s (%s)",
+                        "Could not remove duplicate server commands from %s (%s)",
                         installed_guild.id,
                         type(exc).__name__,
                     )
-            self._guild_commands_synced = synced_guilds == len(self.guilds)
-            LOGGER.info("Synced commands directly to %d server(s)", synced_guilds)
+            self._guild_commands_cleaned = cleaned_guilds == len(self.guilds)
+            LOGGER.info(
+                "Removed duplicate server command sets from %d server(s)",
+                cleaned_guilds,
+            )
 
         # Reconcile removals that happened while this process was offline. Guilds
         # marked temporarily unavailable remain in self.guilds and are retained.
