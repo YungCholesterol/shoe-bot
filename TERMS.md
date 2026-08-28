@@ -46,6 +46,13 @@ change statistics. Discord-generated system notices are also ignored; ordinary
 messages and replies remain eligible. The exact active rules are available
 through `/shoehelp`.
 
+Random Shoe posts are optional and disabled by default. A server Administrator
+may enable them through `/setup` or `/shoesettings` and choose one or more
+eligible channels. While enabled, Shoe Bot periodically selects one of those
+channels and sends `Shoe` with the bundled image at randomized intervals between
+50 and 103 minutes. Administrators are responsible for choosing appropriate
+channels and may disable the feature at any time.
+
 The leaderboard ranks accepted personal contributions. `/profile` shows fixed
 milestones derived from a user's stored count. The Hall of Fame view inside
 `/leaderboard` shows the ten highest distinct completed streak lengths for that

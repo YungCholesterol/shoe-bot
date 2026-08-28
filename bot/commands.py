@@ -305,6 +305,8 @@ def _settings_embed(
     channel_id: int | None,
     matching_mode: str,
     gameplay_mode: str,
+    random_shoe_enabled: bool,
+    random_shoe_channel_ids: Sequence[int],
     guild: discord.Guild,
 ) -> discord.Embed:
     channel = guild.get_channel(channel_id) if channel_id is not None else None
@@ -342,6 +344,16 @@ def _settings_embed(
     embed.add_field(name="Channel", value=channel_text, inline=False)
     embed.add_field(name="Matching", value=matching_text, inline=False)
     embed.add_field(name="Gameplay", value=gameplay_text, inline=False)
+    random_channels = " ".join(f"<#{channel_id}>" for channel_id in random_shoe_channel_ids)
+    embed.add_field(
+        name="Random Shoe posts",
+        value=(
+            ("Enabled · " + (random_channels or "no channels selected"))
+            if random_shoe_enabled else
+            "Off (default). Select channels and turn it on to post `Shoe` with the image every 50–103 minutes."
+        ),
+        inline=False,
+    )
     embed.add_field(name="Permission check", value=permission_text, inline=False)
     embed.add_field(
         name="Portal check",
@@ -369,6 +381,8 @@ class SetupWizardView(discord.ui.View):
         is_current: Callable[[], bool],
         finished: Callable[[], None],
         title: str,
+        initial_random_shoe_enabled: bool = False,
+        initial_random_shoe_channel_ids: Sequence[int] = (),
         start_reset: Callable[[discord.Interaction], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(timeout=180.0)
@@ -379,6 +393,8 @@ class SetupWizardView(discord.ui.View):
         self._channel_id = initial_channel_id
         self._matching_mode = initial_matching_mode
         self._gameplay_mode = initial_gameplay_mode
+        self._random_shoe_enabled = initial_random_shoe_enabled
+        self._random_shoe_channel_ids = tuple(initial_random_shoe_channel_ids)
         self._is_current = is_current
         self._finished = finished
         self._title = title
@@ -394,6 +410,13 @@ class SetupWizardView(discord.ui.View):
             option.default = option.value == initial_gameplay_mode
         if start_reset is None:
             self.remove_item(self.reset_data)
+        self.toggle_random_posts.label = (
+            "Random posts: ON" if initial_random_shoe_enabled else "Random posts: OFF"
+        )
+        self.toggle_random_posts.style = (
+            discord.ButtonStyle.success
+            if initial_random_shoe_enabled else discord.ButtonStyle.secondary
+        )
 
     def bind_message(self, message: discord.InteractionMessage) -> None:
         self._message = message
@@ -404,6 +427,8 @@ class SetupWizardView(discord.ui.View):
             channel_id=self._channel_id,
             matching_mode=self._matching_mode,
             gameplay_mode=self._gameplay_mode,
+            random_shoe_enabled=self._random_shoe_enabled,
+            random_shoe_channel_ids=self._random_shoe_channel_ids,
             guild=self._guild,
         )
 
@@ -534,7 +559,7 @@ class SetupWizardView(discord.ui.View):
                 view=self,
             )
 
-    @discord.ui.button(label="Run diagnostic", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Run diagnostic", style=discord.ButtonStyle.secondary, row=4)
     async def recheck(
         self,
         interaction: discord.Interaction,
@@ -550,7 +575,34 @@ class SetupWizardView(discord.ui.View):
                 view=self,
             )
 
-    @discord.ui.button(label="Save settings", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Random Shoe channels (optional)",
+        min_values=0,
+        max_values=25,
+        row=3,
+    )
+    async def random_channels_select(
+        self, interaction: discord.Interaction, select: discord.ui.ChannelSelect,
+    ) -> None:
+        await interaction.response.defer()
+        async with self._callback_lock:
+            self._random_shoe_channel_ids = tuple(channel.id for channel in select.values)
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Random posts: OFF", style=discord.ButtonStyle.secondary, row=4)
+    async def toggle_random_posts(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer()
+        async with self._callback_lock:
+            self._random_shoe_enabled = not self._random_shoe_enabled
+            button.label = "Random posts: ON" if self._random_shoe_enabled else "Random posts: OFF"
+            button.style = discord.ButtonStyle.success if self._random_shoe_enabled else discord.ButtonStyle.secondary
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Save settings", style=discord.ButtonStyle.primary, row=4)
     async def save(
         self,
         interaction: discord.Interaction,
@@ -580,6 +632,21 @@ class SetupWizardView(discord.ui.View):
                     + ". Fix them, then select Run diagnostic.",
                 )
                 return
+            if self._random_shoe_enabled and not self._random_shoe_channel_ids:
+                await _private_error(interaction, "Select at least one Random Shoe channel before turning it on.")
+                return
+            for random_channel_id in self._random_shoe_channel_ids:
+                random_channel = self._guild.get_channel(random_channel_id)
+                if not isinstance(random_channel, discord.TextChannel):
+                    await _private_error(interaction, "Every Random Shoe destination must be an existing text channel.")
+                    return
+                random_missing = _missing_permissions(self._guild, random_channel)
+                bot_member = self._guild.me
+                if bot_member is None or not random_channel.permissions_for(bot_member).attach_files:
+                    random_missing.append("Attach Files")
+                if random_missing:
+                    await _private_error(interaction, f"I am missing permissions in {random_channel.mention}: " + ", ".join(random_missing))
+                    return
             if not self._consume():
                 await _private_error(interaction, "These settings have already been used.")
                 return
@@ -590,6 +657,11 @@ class SetupWizardView(discord.ui.View):
                     channel.id,
                     self._matching_mode,
                     self._gameplay_mode,
+                )
+                await self._game.configure_random_shoe(
+                    self._guild_id,
+                    self._random_shoe_enabled,
+                    tuple(self._random_shoe_channel_ids),
                 )
                 self._saved = True
             except DatabaseError as exc:
@@ -627,6 +699,7 @@ class SetupWizardView(discord.ui.View):
                     f"Channel: <#{config.channel_id}>\n"
                     f"Matching: {config.matching_mode.title()}\n"
                     f"Gameplay: {config.gameplay_mode.title()}\n\n"
+                    f"Random Shoe posts: {'On' if self._random_shoe_enabled else 'Off'}\n"
                     "Totals, best streak, personal counts, and existing records "
                     "were not reset. A different channel or mode completes any "
                     "active streak and considers it for the Hall of Fame."
@@ -652,7 +725,7 @@ class SetupWizardView(discord.ui.View):
                         type(followup_exc).__name__,
                     )
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
     async def cancel(
         self,
         interaction: discord.Interaction,
@@ -975,6 +1048,8 @@ class ShoeCommands(commands.Cog):
                 initial_channel_id=stats.channel_id if stats else None,
                 initial_matching_mode=stats.matching_mode if stats else "creative",
                 initial_gameplay_mode=stats.gameplay_mode if stats else "relay",
+                initial_random_shoe_enabled=stats.random_shoe_enabled if stats else False,
+                initial_random_shoe_channel_ids=stats.random_shoe_channel_ids if stats else (),
                 is_current=is_current,
                 finished=finished,
                 title=title,
@@ -1237,7 +1312,10 @@ class ShoeCommands(commands.Cog):
             name="Administrator commands",
             value=(
                 "`/setup` · `/shoesettings`\n"
-                "Settings includes permission diagnostics and the protected server reset."
+                "Settings includes permission diagnostics, the protected server reset, "
+                "and optional Random Shoe posts. When enabled, the bot chooses one of "
+                "the admin-selected channels and posts `Shoe` with the supplied image "
+                "after a fresh random delay of 50–103 minutes. It is off by default."
             ),
             inline=False,
         )

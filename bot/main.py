@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 import logging
 import os
 from pathlib import Path
+import random
 import sys
+import time
 
 import discord
 from discord import app_commands
@@ -19,6 +22,9 @@ from .shoe_game import ShoeGame
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RANDOM_SHOE_IMAGE = PROJECT_ROOT / "assets" / "random-shoe-obama.jpg"
+RANDOM_SHOE_MIN_SECONDS = 50 * 60
+RANDOM_SHOE_MAX_SECONDS = 103 * 60
 LOGGER = logging.getLogger(__name__)
 
 
@@ -92,10 +98,61 @@ class ShoeBot(commands.Bot):
         self.database = database
         self.game = ShoeGame(database)
         self.tree.on_error = self.on_app_command_error
+        self._random_shoe_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _next_random_shoe_at() -> int:
+        return int(time.time()) + random.randint(
+            RANDOM_SHOE_MIN_SECONDS, RANDOM_SHOE_MAX_SECONDS
+        )
+
+    async def _random_shoe_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                configs = await self.database.run(self.database.load_guild_configs)
+                now = int(time.time())
+                for guild_id, config in configs.items():
+                    if not config.random_shoe_enabled or not config.random_shoe_channel_ids:
+                        continue
+                    if config.random_shoe_next_at is None:
+                        await self.database.run(
+                            self.database.set_random_shoe_next_at,
+                            guild_id,
+                            self._next_random_shoe_at(),
+                        )
+                        continue
+                    if config.random_shoe_next_at > now:
+                        continue
+                    candidates = [
+                        channel for channel_id in config.random_shoe_channel_ids
+                        if isinstance((channel := self.get_channel(channel_id)), discord.TextChannel)
+                    ]
+                    if candidates:
+                        channel = random.choice(candidates)
+                        try:
+                            await channel.send(
+                                "Shoe",
+                                file=discord.File(RANDOM_SHOE_IMAGE, filename="shoe.jpg"),
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+                            LOGGER.warning("Could not send a Random Shoe post (%s)", type(exc).__name__)
+                    await self.database.run(
+                        self.database.set_random_shoe_next_at,
+                        guild_id,
+                        self._next_random_shoe_at(),
+                    )
+            except DatabaseError as exc:
+                LOGGER.error("Random Shoe scheduler database error (%s)", type(exc).__name__)
+            await asyncio.sleep(30)
 
     async def setup_hook(self) -> None:
         await self.game.load_configuration()
         await self.add_cog(ShoeCommands(self.database, self.game))
+        self._random_shoe_task = asyncio.create_task(
+            self._random_shoe_loop(), name="random-shoe-scheduler"
+        )
 
         try:
             if self.config.development_guild_id is not None:
@@ -163,6 +220,9 @@ class ShoeBot(commands.Bot):
         )
 
     async def close(self) -> None:
+        if self._random_shoe_task is not None:
+            self._random_shoe_task.cancel()
+            await asyncio.gather(self._random_shoe_task, return_exceptions=True)
         try:
             await super().close()
         finally:

@@ -469,6 +469,23 @@ class ShoeDatabaseTests(unittest.TestCase):
         self.database = ShoeDatabase(self.database_path)
         self.assertEqual(len(self.database.get_hall_of_fame(100)), 1)
 
+    def test_random_shoe_is_opt_in_and_persists_multiple_channels(self) -> None:
+        self.configure()
+        config = self.database.load_guild_configs()[100]
+        self.assertFalse(config.random_shoe_enabled)
+        self.assertEqual(config.random_shoe_channel_ids, ())
+
+        self.database.configure_random_shoe(100, True, (201, 202, 201), 123456)
+        config = self.database.load_guild_configs()[100]
+        self.assertTrue(config.random_shoe_enabled)
+        self.assertEqual(config.random_shoe_channel_ids, (201, 202))
+        self.assertEqual(config.random_shoe_next_at, 123456)
+
+    def test_random_shoe_requires_a_channel_when_enabled(self) -> None:
+        self.configure()
+        with self.assertRaises(ValueError):
+            self.database.configure_random_shoe(100, True, (), 123456)
+
     def test_newer_database_schema_fails_closed(self) -> None:
         self.database.close()
         connection = sqlite3.connect(self.database_path)
@@ -489,6 +506,8 @@ class ShoeDatabaseTests(unittest.TestCase):
             DROP TABLE IF EXISTS user_stats;
             DROP TABLE IF EXISTS schema_metadata;
             DROP TABLE IF EXISTS guild_settings;
+            DROP TABLE IF EXISTS random_shoe_channels;
+            DROP TABLE IF EXISTS random_shoe_settings;
             PRAGMA user_version = 2;
             """
         )

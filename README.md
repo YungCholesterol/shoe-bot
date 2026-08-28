@@ -61,6 +61,13 @@ leaves the active streak unchanged.
 | `/setup` | Administrator | Walk through channel, matching, gameplay, and permission setup. |
 | `/shoesettings` | Administrator | Change settings, run diagnostics, or open the protected server reset. |
 
+Both `/setup` and `/shoesettings` include **Random Shoe posts**, an optional
+feature that is off by default. An administrator may select one or more text
+channels and enable it. While enabled, the bot waits a newly randomized 50 to
+103 minutes, chooses one configured channel, and sends `Shoe` with the bundled
+image. With one selected channel, every post goes there. The original image is
+stored and sent without resizing or recompression.
+
 The reset control inside `/shoesettings` atomically deletes the server's total,
 current and best streaks, personal counts, Hall of Fame records, and Relay
 state. It preserves the configured channel and selected modes. The settings

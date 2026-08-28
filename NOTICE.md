@@ -15,4 +15,7 @@ duties and is identified as public domain in the United States.
 Source: [President Barack Obama.jpg on Wikimedia Commons](https://commons.wikimedia.org/wiki/File:President_Barack_Obama.jpg)
 
 Contact: [yungcholesterol@gmail.com](mailto:yungcholesterol@gmail.com)
-
+The optional Random Shoe feature includes a user-supplied low-resolution image
+of Barack Obama. Shoe Bot is independent and is not affiliated with, sponsored
+by, or endorsed by Barack Obama. The image is transmitted only to channels an
+administrator selects after explicitly enabling the feature.

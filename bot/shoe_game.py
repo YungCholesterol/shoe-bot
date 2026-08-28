@@ -181,6 +181,24 @@ class ShoeGame:
             existing.gameplay_mode if existing else "relay",
         )
 
+    async def configure_random_shoe(
+        self, guild_id: int, enabled: bool, channel_ids: tuple[int, ...]
+    ) -> None:
+        async with self._state_lock:
+            if self._closing:
+                raise DatabaseError("Shoe game is shutting down")
+            _, cancellation = await self._finish_transition(
+                self._database.run(
+                    self._database.configure_random_shoe,
+                    guild_id,
+                    enabled,
+                    channel_ids,
+                    None,
+                )
+            )
+            if cancellation is not None:
+                raise cancellation
+
     def configured_channel_id(self, guild_id: int) -> int | None:
         config = self._guild_configs.get(guild_id)
         return config.channel_id if config is not None else None

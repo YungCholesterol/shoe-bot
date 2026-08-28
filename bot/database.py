@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Callable, Iterator, Literal, TypeVar
+from typing import Callable, Iterator, Literal, Sequence, TypeVar
 
 
 MatchingMode = Literal["classic", "creative"]
@@ -41,6 +41,9 @@ class GuildConfig:
     channel_id: int
     matching_mode: MatchingMode
     gameplay_mode: GameplayMode
+    random_shoe_enabled: bool = False
+    random_shoe_channel_ids: tuple[int, ...] = ()
+    random_shoe_next_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +54,8 @@ class GuildStats:
     best_streak: int
     matching_mode: MatchingMode
     gameplay_mode: GameplayMode
+    random_shoe_enabled: bool = False
+    random_shoe_channel_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +191,7 @@ class ShoeDatabase:
             user_version = int(
                 self._connection.execute("PRAGMA user_version").fetchone()[0]
             )
-            if user_version > 2:
+            if user_version > 3:
                 raise sqlite3.DatabaseError(
                     "Database schema is newer than this Shoe Bot release"
                 )
@@ -309,6 +314,28 @@ class ShoeDatabase:
             )
             self._connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS random_shoe_settings (
+                    guild_id TEXT PRIMARY KEY NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                    next_send_at INTEGER,
+                    FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS random_shoe_channels (
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id),
+                    FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_user_stats_leaderboard
                 ON user_stats (guild_id, shoe_count DESC, user_id ASC)
                 """
@@ -362,7 +389,7 @@ class ShoeDatabase:
             self._connection.execute(
                 """
                 INSERT INTO schema_metadata (metadata_key, metadata_value)
-                VALUES ('schema_version', '2')
+                VALUES ('schema_version', '3')
                 ON CONFLICT (metadata_key) DO UPDATE SET
                     metadata_value = excluded.metadata_value
                 """
@@ -374,7 +401,7 @@ class ShoeDatabase:
                 raise sqlite3.DatabaseError(
                     "Database foreign-key integrity check failed"
                 )
-            self._connection.execute("PRAGMA user_version = 2")
+            self._connection.execute("PRAGMA user_version = 3")
             self._connection.execute("COMMIT")
         except Exception:
             self._rollback_without_masking_error()
@@ -522,20 +549,68 @@ class ShoeDatabase:
             try:
                 rows = self._connection.execute(
                     """
-                    SELECT guild_id, shoe_channel_id, matching_mode, gameplay_mode
-                    FROM guild_settings
+                    SELECT g.guild_id, g.shoe_channel_id, g.matching_mode,
+                           g.gameplay_mode, COALESCE(r.enabled, 0) AS random_enabled,
+                           r.next_send_at
+                    FROM guild_settings AS g
+                    LEFT JOIN random_shoe_settings AS r ON r.guild_id = g.guild_id
                     """
                 ).fetchall()
             except sqlite3.Error as exc:
                 raise DatabaseError("Could not load server configuration") from exc
-        return {
+        configs = {
             int(row["guild_id"]): GuildConfig(
                 channel_id=int(row["shoe_channel_id"]),
                 matching_mode=self._matching_mode(str(row["matching_mode"])),
                 gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
+                random_shoe_enabled=bool(row["random_enabled"]),
+                random_shoe_next_at=(int(row["next_send_at"]) if row["next_send_at"] is not None else None),
             )
             for row in rows
         }
+        channel_rows = self._connection.execute(
+            "SELECT guild_id, channel_id FROM random_shoe_channels ORDER BY channel_id"
+        ).fetchall()
+        channels: dict[int, list[int]] = {}
+        for row in channel_rows:
+            channels.setdefault(int(row["guild_id"]), []).append(int(row["channel_id"]))
+        return {
+            guild_id: GuildConfig(
+                config.channel_id, config.matching_mode, config.gameplay_mode,
+                config.random_shoe_enabled, tuple(channels.get(guild_id, ())),
+                config.random_shoe_next_at,
+            ) for guild_id, config in configs.items()
+        }
+
+    def configure_random_shoe(
+        self, guild_id: int | str, enabled: bool,
+        channel_ids: Sequence[int | str], next_send_at: int | None,
+    ) -> None:
+        guild = self._snowflake(guild_id, "guild_id")
+        channels = tuple(dict.fromkeys(self._snowflake(c, "channel_id") for c in channel_ids))
+        if enabled and not channels:
+            raise ValueError("at least one channel is required when enabled")
+        with self._write_transaction() as connection:
+            if connection.execute("SELECT 1 FROM guild_settings WHERE guild_id = ?", (guild,)).fetchone() is None:
+                raise GuildNotConfigured("server is not configured")
+            connection.execute(
+                "INSERT INTO random_shoe_settings (guild_id, enabled, next_send_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (guild_id) DO UPDATE SET enabled=excluded.enabled, next_send_at=excluded.next_send_at",
+                (guild, int(enabled), next_send_at),
+            )
+            connection.execute("DELETE FROM random_shoe_channels WHERE guild_id = ?", (guild,))
+            connection.executemany(
+                "INSERT INTO random_shoe_channels (guild_id, channel_id) VALUES (?, ?)",
+                ((guild, channel) for channel in channels),
+            )
+
+    def set_random_shoe_next_at(self, guild_id: int | str, next_send_at: int) -> None:
+        guild = self._snowflake(guild_id, "guild_id")
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE random_shoe_settings SET next_send_at = ? WHERE guild_id = ?",
+                (next_send_at, guild),
+            )
 
     def load_configured_channels(self) -> dict[int, int]:
         """Backward-compatible channel-only view used by older integrations."""
@@ -662,18 +737,24 @@ class ShoeDatabase:
             try:
                 row = self._connection.execute(
                     """
-                    SELECT shoe_channel_id, total_shoes, current_streak, best_streak,
-                           matching_mode, gameplay_mode
-                    FROM guild_settings
-                    WHERE guild_id = ?
+                    SELECT g.shoe_channel_id, g.total_shoes, g.current_streak,
+                           g.best_streak, g.matching_mode, g.gameplay_mode,
+                           COALESCE(r.enabled, 0) AS random_enabled
+                    FROM guild_settings AS g
+                    LEFT JOIN random_shoe_settings AS r ON r.guild_id = g.guild_id
+                    WHERE g.guild_id = ?
                     """,
                     (guild,),
                 ).fetchone()
             except sqlite3.Error as exc:
                 raise DatabaseError("Could not read server statistics") from exc
 
-        if row is None:
-            return None
+            if row is None:
+                return None
+            channels = self._connection.execute(
+                "SELECT channel_id FROM random_shoe_channels WHERE guild_id = ? ORDER BY channel_id",
+                (guild,),
+            ).fetchall()
         return GuildStats(
             channel_id=int(row["shoe_channel_id"]),
             total_shoes=int(row["total_shoes"]),
@@ -681,6 +762,8 @@ class ShoeDatabase:
             best_streak=int(row["best_streak"]),
             matching_mode=self._matching_mode(str(row["matching_mode"])),
             gameplay_mode=self._gameplay_mode(str(row["gameplay_mode"])),
+            random_shoe_enabled=bool(row["random_enabled"]),
+            random_shoe_channel_ids=tuple(int(item["channel_id"]) for item in channels),
         )
 
     def record_message(
