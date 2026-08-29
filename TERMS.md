@@ -60,6 +60,10 @@ scheduled-post settings and do not reset the timer. They are deliberate administ
 and are not restricted by quiet hours. Administrators remain responsible for
 channel choice, frequency, and server-member expectations.
 
+`/shoesettings` presents these controls in a private, requester-bound control
+center with separate Game, Schedule, Timing, Logs, and More sections. The
+dedicated `/shoelog` and `/shoetiming` commands remain available as shortcuts.
+
 The leaderboard ranks accepted personal contributions. `/profile` shows fixed
 milestones derived from a user's stored count. The Hall of Fame view inside
 `/leaderboard` shows the ten highest distinct completed streak lengths for that

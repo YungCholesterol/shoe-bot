@@ -834,6 +834,496 @@ class SetupWizardView(discord.ui.View):
         await _replace_with_terminal_view(interaction, text=text, view=self)
 
 
+class TimingModal(discord.ui.Modal, title="Random Shoe timing"):
+    minimum = discord.ui.TextInput(
+        label="Minimum delay (minutes)", min_length=1, max_length=4,
+        placeholder="50",
+    )
+    maximum = discord.ui.TextInput(
+        label="Maximum delay (minutes)", min_length=1, max_length=4,
+        placeholder="103",
+    )
+    quiet_start = discord.ui.TextInput(
+        label="Quiet start hour UTC (optional)", required=False,
+        min_length=1, max_length=2, placeholder="0–23",
+    )
+    quiet_end = discord.ui.TextInput(
+        label="Quiet end hour UTC (optional)", required=False,
+        min_length=1, max_length=2, placeholder="0–23",
+    )
+
+    def __init__(self, parent: "SettingsHubView") -> None:
+        super().__init__()
+        self._parent = parent
+        self.minimum.default = str(parent.random_min_minutes)
+        self.maximum.default = str(parent.random_max_minutes)
+        self.quiet_start.default = (
+            "" if parent.quiet_start_hour is None else str(parent.quiet_start_hour)
+        )
+        self.quiet_end.default = (
+            "" if parent.quiet_end_hour is None else str(parent.quiet_end_hour)
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self._parent.interaction_check(interaction):
+            return
+        try:
+            minimum = int(self.minimum.value)
+            maximum = int(self.maximum.value)
+            quiet_start = int(self.quiet_start.value) if self.quiet_start.value else None
+            quiet_end = int(self.quiet_end.value) if self.quiet_end.value else None
+        except ValueError:
+            await interaction.response.send_message(
+                "Use whole numbers for timing and quiet hours.", ephemeral=True
+            )
+            return
+        if not 5 <= minimum <= maximum <= 1440:
+            await interaction.response.send_message(
+                "Timing must be 5–1440 minutes, and minimum cannot exceed maximum.",
+                ephemeral=True,
+            )
+            return
+        if (quiet_start is None) != (quiet_end is None) or any(
+            value is not None and not 0 <= value <= 23
+            for value in (quiet_start, quiet_end)
+        ):
+            await interaction.response.send_message(
+                "Quiet hours need both a start and end from 0–23 UTC, or both blank.",
+                ephemeral=True,
+            )
+            return
+        await self._parent.save_timing(
+            interaction, minimum, maximum, quiet_start, quiet_end
+        )
+
+
+class SettingsHubView(discord.ui.View):
+    """Compact, status-first administrator control center for `/shoesettings`."""
+
+    SECTIONS = ("Game", "Schedule", "Timing", "Logs", "More")
+
+    def __init__(
+        self,
+        *,
+        game: ShoeGame,
+        guild: discord.Guild,
+        requester_id: int,
+        stats: GuildStats,
+        is_current: Callable[[], bool],
+        finished: Callable[[], None],
+        start_reset: Callable[[discord.Interaction], Awaitable[None]],
+    ) -> None:
+        super().__init__(timeout=300.0)
+        self._game = game
+        self._guild = guild
+        self._guild_id = guild.id
+        self._requester_id = requester_id
+        self._is_current = is_current
+        self._finished = finished
+        self._start_reset = start_reset
+        self._message: discord.InteractionMessage | None = None
+        self._section = "Schedule"
+        self._closed = False
+        self._callback_lock = asyncio.Lock()
+
+        self.channel_id = stats.channel_id
+        self.matching_mode = stats.matching_mode
+        self.gameplay_mode = stats.gameplay_mode
+        self.random_enabled = stats.random_shoe_enabled
+        self.random_channel_ids = tuple(stats.random_shoe_channel_ids)
+        self.random_min_minutes = stats.random_shoe_min_minutes
+        self.random_max_minutes = stats.random_shoe_max_minutes
+        self.quiet_start_hour = stats.quiet_start_hour
+        self.quiet_end_hour = stats.quiet_end_hour
+        self.log_channel_id = stats.log_channel_id
+        self.next_send_at = stats.random_shoe_next_at
+        self._render()
+
+    def bind_message(self, message: discord.InteractionMessage) -> None:
+        self._message = message
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self._requester_id:
+            await _private_error(
+                interaction,
+                "Only the administrator who opened this control center can use it.",
+            )
+            return False
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        valid = bool(
+            interaction.guild_id == self._guild_id
+            and permissions
+            and permissions.administrator
+            and self._is_current()
+            and not self._closed
+        )
+        if not valid:
+            await _private_error(
+                interaction,
+                "This control center expired. Run `/shoesettings` again.",
+            )
+        return valid
+
+    def _health(self) -> tuple[bool, list[str]]:
+        problems: list[str] = []
+        game_channel = self._guild.get_channel(self.channel_id)
+        if not isinstance(game_channel, discord.TextChannel):
+            problems.append("game channel is missing")
+        elif _missing_permissions(self._guild, game_channel):
+            problems.append("game channel permissions need attention")
+        if not RANDOM_SHOE_IMAGE.is_file():
+            problems.append("Shoe image is missing")
+        if self.random_enabled and not self.random_channel_ids:
+            problems.append("scheduled posts need a destination")
+        if self.random_enabled and self.log_channel_id is None:
+            problems.append("scheduled posts need an audit-log channel")
+        return not problems, problems
+
+    def build_embed(self) -> discord.Embed:
+        healthy, problems = self._health()
+        status = "All systems healthy" if healthy else "Needs attention"
+        colour = discord.Colour.green() if healthy else discord.Colour.orange()
+        if not self.random_enabled:
+            next_post = "Paused"
+        elif self.next_send_at is not None:
+            next_post = f"<t:{self.next_send_at}:R>"
+        else:
+            next_post = "Scheduling now"
+        embed = discord.Embed(
+            title="Shoe Bot control center",
+            description=(
+                f"**{status}** · Next scheduled Shoe: **{next_post}**\n"
+                "Use the tabs below. Only the controls for the open section are shown."
+            ),
+            colour=colour,
+        )
+        embed.add_field(
+            name="Overview",
+            value=(
+                f"Game <#{self.channel_id}> · {self.matching_mode.title()} / {self.gameplay_mode.title()}\n"
+                f"Scheduled posts {'On' if self.random_enabled else 'Off'} · "
+                f"{len(self.random_channel_ids)} destination(s) · "
+                f"{self.random_min_minutes}–{self.random_max_minutes} min"
+            ),
+            inline=False,
+        )
+        if self._section == "Game":
+            embed.add_field(
+                name="Game",
+                value=(
+                    "Choose the dedicated channel and the two game rules, then save. "
+                    "Changing them completes any active streak but keeps all records."
+                ),
+                inline=False,
+            )
+        elif self._section == "Schedule":
+            destinations = " ".join(f"<#{item}>" for item in self.random_channel_ids)
+            embed.add_field(
+                name="Scheduled Shoe posts",
+                value=(
+                    f"State: **{'On' if self.random_enabled else 'Off'}**\n"
+                    f"Destinations: {destinations or 'None selected'}\n"
+                    "Select one or more channels, toggle the state if needed, then save."
+                ),
+                inline=False,
+            )
+        elif self._section == "Timing":
+            quiet = (
+                "Off" if self.quiet_start_hour is None
+                else f"{self.quiet_start_hour:02d}:00–{self.quiet_end_hour:02d}:00 UTC"
+            )
+            embed.add_field(
+                name="Timing & quiet hours",
+                value=(
+                    f"Random delay: **{self.random_min_minutes}–{self.random_max_minutes} minutes**\n"
+                    f"Quiet hours: **{quiet}**\n"
+                    "The timer is stored in the database; the bot does not burn usage counting every second."
+                ),
+                inline=False,
+            )
+        elif self._section == "Logs":
+            embed.add_field(
+                name="Admin audit log",
+                value=(
+                    f"Channel: {f'<#{self.log_channel_id}>' if self.log_channel_id else 'Not selected'}\n"
+                    "Receives settings changes and scheduler notices."
+                ),
+                inline=False,
+            )
+        else:
+            detail = "No problems detected." if healthy else "Fix: " + "; ".join(problems) + "."
+            embed.add_field(
+                name="Health & maintenance",
+                value=(
+                    detail
+                    + "\n`/forceshoe` can send one post immediately without changing this schedule."
+                ),
+                inline=False,
+            )
+        embed.set_footer(text=f"{self._section} · Private admin panel · Expires after 5 minutes")
+        return embed
+
+    def _add_button(
+        self, label: str, style: discord.ButtonStyle, row: int,
+        callback: Callable[[discord.Interaction], Awaitable[None]],
+    ) -> None:
+        button = discord.ui.Button(label=label, style=style, row=row)
+
+        async def wrapped(interaction: discord.Interaction) -> None:
+            await callback(interaction)
+
+        button.callback = wrapped
+        self.add_item(button)
+
+    def _render(self) -> None:
+        self.clear_items()
+        for label in self.SECTIONS:
+            async def open_section(
+                interaction: discord.Interaction, section: str = label
+            ) -> None:
+                await interaction.response.defer()
+                async with self._callback_lock:
+                    self._section = section
+                    self._render()
+                    await interaction.edit_original_response(
+                        content=None, embed=self.build_embed(), view=self
+                    )
+
+            self._add_button(
+                label,
+                discord.ButtonStyle.primary if label == self._section else discord.ButtonStyle.secondary,
+                0,
+                open_section,
+            )
+
+        if self._section == "Game":
+            channel = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Game channel",
+                min_values=1, max_values=1, row=1,
+            )
+            async def choose_game(interaction: discord.Interaction) -> None:
+                self.channel_id = channel.values[0].id
+                await self._refresh(interaction)
+            channel.callback = choose_game
+            self.add_item(channel)
+            matching = discord.ui.Select(
+                placeholder="Matching mode",
+                options=[
+                    discord.SelectOption(label="Creative (recommended)", value="creative", default=self.matching_mode == "creative"),
+                    discord.SelectOption(label="Classic", value="classic", default=self.matching_mode == "classic"),
+                ], row=2,
+            )
+            async def choose_matching(interaction: discord.Interaction) -> None:
+                self.matching_mode = matching.values[0]
+                self._render()
+                await self._refresh(interaction)
+            matching.callback = choose_matching
+            self.add_item(matching)
+            gameplay = discord.ui.Select(
+                placeholder="Gameplay mode",
+                options=[
+                    discord.SelectOption(label="Relay (recommended)", value="relay", default=self.gameplay_mode == "relay"),
+                    discord.SelectOption(label="Standard", value="standard", default=self.gameplay_mode == "standard"),
+                ], row=3,
+            )
+            async def choose_gameplay(interaction: discord.Interaction) -> None:
+                self.gameplay_mode = gameplay.values[0]
+                self._render()
+                await self._refresh(interaction)
+            gameplay.callback = choose_gameplay
+            self.add_item(gameplay)
+            self._add_button("Save game", discord.ButtonStyle.success, 4, self._save_game)
+        elif self._section == "Schedule":
+            destinations = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text],
+                placeholder="Scheduled-post destinations",
+                min_values=0, max_values=25, row=1,
+            )
+            async def choose_destinations(interaction: discord.Interaction) -> None:
+                self.random_channel_ids = tuple(item.id for item in destinations.values)
+                await self._refresh(interaction)
+            destinations.callback = choose_destinations
+            self.add_item(destinations)
+            self._add_button(
+                "Turn off" if self.random_enabled else "Turn on",
+                discord.ButtonStyle.danger if self.random_enabled else discord.ButtonStyle.success,
+                2, self._toggle_schedule,
+            )
+            self._add_button("Save schedule", discord.ButtonStyle.primary, 2, self._save_schedule)
+        elif self._section == "Timing":
+            self._add_button("Edit timing", discord.ButtonStyle.primary, 1, self._open_timing)
+        elif self._section == "Logs":
+            logs = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.text], placeholder="Audit-log channel",
+                min_values=1, max_values=1, row=1,
+            )
+            async def choose_logs(interaction: discord.Interaction) -> None:
+                self.log_channel_id = logs.values[0].id
+                await self._refresh(interaction)
+            logs.callback = choose_logs
+            self.add_item(logs)
+            self._add_button("Save log channel", discord.ButtonStyle.primary, 2, self._save_logs)
+            self._add_button("Send test log", discord.ButtonStyle.secondary, 2, self._test_log)
+        else:
+            self._add_button("Refresh health", discord.ButtonStyle.primary, 1, self._refresh_health)
+            self._add_button("Reset server data", discord.ButtonStyle.danger, 1, self._reset)
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await interaction.edit_original_response(
+            content=None, embed=self.build_embed(), view=self
+        )
+
+    async def _save_random(self) -> None:
+        await self._game.configure_random_shoe(
+            self._guild_id, self.random_enabled, self.random_channel_ids,
+            self.random_min_minutes, self.random_max_minutes,
+            self.quiet_start_hour, self.quiet_end_hour, self.log_channel_id,
+        )
+        self.next_send_at = None
+
+    async def _audit(self, text: str) -> None:
+        channel = self._guild.get_channel(self.log_channel_id) if self.log_channel_id else None
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(
+                    "Shoe Bot audit · " + text,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException:
+                pass
+
+    async def _save_game(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        channel = self._guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await _private_error(interaction, "Choose an existing game channel.")
+            return
+        missing = _missing_permissions(self._guild, channel)
+        if missing:
+            await _private_error(interaction, "Missing in that channel: " + ", ".join(missing))
+            return
+        await self._game.configure_guild(
+            self._guild_id, channel.id, self.matching_mode, self.gameplay_mode
+        )
+        await self._audit(f"Game settings changed by <@{self._requester_id}>.")
+        await interaction.edit_original_response(
+            content="Game settings saved.", embed=self.build_embed(), view=self
+        )
+
+    async def _toggle_schedule(self, interaction: discord.Interaction) -> None:
+        self.random_enabled = not self.random_enabled
+        self._render()
+        await self._refresh(interaction)
+
+    async def _save_schedule(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if self.random_enabled and not self.random_channel_ids:
+            await _private_error(interaction, "Choose at least one destination before turning posts on.")
+            return
+        if self.random_enabled and self.log_channel_id is None:
+            await _private_error(interaction, "Choose an audit-log channel in the Logs tab first.")
+            return
+        for channel_id in self.random_channel_ids:
+            channel = self._guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                await _private_error(interaction, "Every destination must be an existing text channel.")
+                return
+            missing = _missing_permissions(self._guild, channel)
+            member = self._guild.me
+            if member is None or not channel.permissions_for(member).attach_files:
+                missing.append("Attach Files")
+            if missing:
+                await _private_error(interaction, f"Missing in {channel.mention}: " + ", ".join(missing))
+                return
+        await self._save_random()
+        self._render()
+        await self._audit(f"Scheduled posts {'enabled' if self.random_enabled else 'paused'} by <@{self._requester_id}>.")
+        await interaction.edit_original_response(
+            content="Schedule saved.", embed=self.build_embed(), view=self
+        )
+
+    async def _open_timing(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(TimingModal(self))
+
+    async def save_timing(
+        self, interaction: discord.Interaction, minimum: int, maximum: int,
+        quiet_start: int | None, quiet_end: int | None,
+    ) -> None:
+        self.random_min_minutes = minimum
+        self.random_max_minutes = maximum
+        self.quiet_start_hour = quiet_start
+        self.quiet_end_hour = quiet_end
+        await self._save_random()
+        await self._audit(f"Timing changed by <@{self._requester_id}>.")
+        await interaction.response.edit_message(
+            content="Timing saved.", embed=self.build_embed(), view=self
+        )
+
+    async def _save_logs(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        channel = self._guild.get_channel(self.log_channel_id) if self.log_channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            await _private_error(interaction, "Choose an existing audit-log channel.")
+            return
+        missing = _missing_permissions(self._guild, channel)
+        if missing:
+            await _private_error(
+                interaction, "Missing in that audit channel: " + ", ".join(missing)
+            )
+            return
+        await self._save_random()
+        await self._audit(f"Audit channel selected by <@{self._requester_id}>.")
+        await interaction.edit_original_response(
+            content="Audit-log channel saved.", embed=self.build_embed(), view=self
+        )
+
+    async def _test_log(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if self.log_channel_id is None:
+            await _private_error(interaction, "Choose and save an audit-log channel first.")
+            return
+        await self._audit(f"Test log requested by <@{self._requester_id}>.")
+        await interaction.edit_original_response(
+            content="Test log sent.", embed=self.build_embed(), view=self
+        )
+
+    async def _refresh_health(self, interaction: discord.Interaction) -> None:
+        await self._refresh(interaction)
+
+    async def _reset(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        self._closed = True
+        self._finished()
+        _disable_view(self)
+        self.stop()
+        await self._start_reset(interaction)
+
+    async def on_timeout(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finished()
+        _disable_view(self)
+        self.stop()
+        if self._message is not None:
+            try:
+                await self._message.edit(
+                    content="Control center expired. Run `/shoesettings` to reopen it.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception,
+        _item: discord.ui.Item,
+    ) -> None:
+        LOGGER.error("Settings control center failed (%s)", type(error).__name__)
+        await _private_error(interaction, "That setting could not be updated. Try `/shoesettings` again.")
+
+
 class ResetConfirmationView(discord.ui.View):
     def __init__(
         self,
@@ -1147,6 +1637,46 @@ class ShoeCommands(commands.Cog):
                 view.stop()
             raise
 
+    async def _open_settings_hub(
+        self, interaction: discord.Interaction, stats: GuildStats
+    ) -> None:
+        if interaction.guild is None or interaction.guild_id is None:
+            await _private_error(interaction, "This command can only be used in a server.")
+            return
+        token = object()
+        guild_id = interaction.guild_id
+        self._pending_settings_tokens[guild_id] = token
+
+        def is_current() -> bool:
+            return self._pending_settings_tokens.get(guild_id) is token
+
+        def finished() -> None:
+            if is_current():
+                self._pending_settings_tokens.pop(guild_id, None)
+
+        try:
+            view = SettingsHubView(
+                game=self._game,
+                guild=interaction.guild,
+                requester_id=interaction.user.id,
+                stats=stats,
+                is_current=is_current,
+                finished=finished,
+                start_reset=self._open_reset_confirmation,
+            )
+            message = await interaction.edit_original_response(
+                content=None,
+                embed=view.build_embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            view.bind_message(message)
+        except BaseException:
+            finished()
+            if "view" in locals():
+                view.stop()
+            raise
+
     @app_commands.command(name="setup", description="Set up Shoe Bot in this server")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
@@ -1177,12 +1707,7 @@ class ShoeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         stats = await self._guild_stats_or_error(interaction)
         if stats is not None:
-            await self._open_settings(
-                interaction,
-                stats=stats,
-                title="Shoe Bot settings",
-                start_reset=self._open_reset_confirmation,
-            )
+            await self._open_settings_hub(interaction, stats)
 
     @app_commands.command(name="shoelog", description="Choose the private Shoe Bot audit-log channel")
     @app_commands.describe(channel="Channel for settings changes and scheduler notices")
@@ -1476,8 +2001,9 @@ class ShoeCommands(commands.Cog):
             value=(
                 "`/setup` · `/shoesettings`\n"
                 "`/shoelog` · `/shoetiming` · `/shoestatus` · `/forceshoe`\n"
-                "Settings includes permission diagnostics, the protected server reset, "
-                "and optional Random Shoe posts. When enabled, the bot chooses one of "
+                "`/shoesettings` is a status-first control center with Game, Schedule, "
+                "Timing, Logs, and More tabs. It includes permission diagnostics, the protected "
+                "server reset, and optional Random Shoe posts. When enabled, the bot chooses one of "
                 "the admin-selected channels and posts `Shoe` with the supplied image "
                 "after a fresh configurable random delay, with optional UTC quiet hours. It is off by default."
             ),

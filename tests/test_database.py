@@ -486,6 +486,9 @@ class ShoeDatabaseTests(unittest.TestCase):
         self.assertEqual((config.random_shoe_min_minutes, config.random_shoe_max_minutes), (30, 90))
         self.assertEqual((config.quiet_start_hour, config.quiet_end_hour), (23, 7))
         self.assertEqual(config.log_channel_id, 299)
+        stats = self.database.get_guild_stats(100)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats.random_shoe_next_at, 123456)
 
     def test_random_shoe_requires_a_channel_when_enabled(self) -> None:
         self.configure()

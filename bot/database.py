@@ -66,6 +66,7 @@ class GuildStats:
     quiet_start_hour: int | None = None
     quiet_end_hour: int | None = None
     log_channel_id: int | None = None
+    random_shoe_next_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -792,7 +793,8 @@ class ShoeDatabase:
                            COALESCE(r.enabled, 0) AS random_enabled,
                            COALESCE(r.min_minutes, 50) AS min_minutes,
                            COALESCE(r.max_minutes, 103) AS max_minutes,
-                           r.quiet_start_hour, r.quiet_end_hour, r.log_channel_id
+                           r.quiet_start_hour, r.quiet_end_hour, r.log_channel_id,
+                           r.next_send_at
                     FROM guild_settings AS g
                     LEFT JOIN random_shoe_settings AS r ON r.guild_id = g.guild_id
                     WHERE g.guild_id = ?
@@ -822,6 +824,7 @@ class ShoeDatabase:
             quiet_start_hour=(int(row["quiet_start_hour"]) if row["quiet_start_hour"] is not None else None),
             quiet_end_hour=(int(row["quiet_end_hour"]) if row["quiet_end_hour"] is not None else None),
             log_channel_id=(int(row["log_channel_id"]) if row["log_channel_id"] is not None else None),
+            random_shoe_next_at=(int(row["next_send_at"]) if row["next_send_at"] is not None else None),
         )
 
     def record_message(

@@ -13,6 +13,7 @@ from discord import app_commands
 from bot.commands import (
     LeaderboardView,
     ResetConfirmationView,
+    SettingsHubView,
     SetupWizardView,
     ShoeCommands,
 )
@@ -336,20 +337,36 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         )
         await ShoeCommands.shoesettings.callback(cog, command_interaction)
         view = command_interaction.response.messages[-1][1]["view"]
+        self.assertIsInstance(view, SettingsHubView)
         labels = {getattr(item, "label", None) for item in view.children}
-        self.assertIn("Run diagnostic", labels)
-        self.assertIn("Reset server data", labels)
+        self.assertEqual(
+            {"Game", "Schedule", "Timing", "Logs", "More"} - labels,
+            set(),
+        )
 
+        more = next(item for item in view.children if getattr(item, "label", None) == "More")
         component_interaction = FakeInteraction(
             user_id=300,
             guild_id=100,
             administrator=True,
             component=True,
         )
-        await view.reset_data.callback(component_interaction)
-        reset_view = component_interaction.response.messages[-1][1]["view"]
+        await more.callback(component_interaction)
+        labels = {getattr(item, "label", None) for item in view.children}
+        self.assertIn("Refresh health", labels)
+        self.assertIn("Reset server data", labels)
+
+        reset_interaction = FakeInteraction(
+            user_id=300,
+            guild_id=100,
+            administrator=True,
+            component=True,
+        )
+        reset = next(item for item in view.children if getattr(item, "label", None) == "Reset server data")
+        await reset.callback(reset_interaction)
+        reset_view = reset_interaction.response.messages[-1][1]["view"]
         self.assertIsInstance(reset_view, ResetConfirmationView)
-        self.assertTrue(component_interaction.response.is_done())
+        self.assertTrue(reset_interaction.response.is_done())
         self.assertTrue(view.is_finished())
         self.assertTrue(all(item.disabled for item in view.children))
         self.assertNotIn(100, cog._pending_settings_tokens)

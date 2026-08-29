@@ -59,7 +59,7 @@ leaves the active streak unchanged.
 | `/shoehelp` | Everyone | Show active rules, or recommended defaults before setup, plus commands, policies, and support. |
 | `/forgetme` | Everyone | Delete the caller's stored user ID and personal count. |
 | `/setup` | Administrator | Walk through channel, matching, gameplay, and permission setup. |
-| `/shoesettings` | Administrator | Change settings, run diagnostics, or open the protected server reset. |
+| `/shoesettings` | Administrator | Open the status-first control center with focused Game, Schedule, Timing, Logs, and More tabs. |
 | `/shoelog` | Administrator | Choose the private audit-log channel required for Random Shoe posts. |
 | `/shoetiming` | Administrator | Configure randomized timing and UTC quiet hours. |
 | `/shoestatus` | Everyone | Report bot and Random Shoe configuration health. |
@@ -69,9 +69,10 @@ leaves the active streak unchanged.
 
 Random Shoe posts are a first-class optional feature and remain **off by
 default**. Administrators can select one or more destinations in `/setup` or
-`/shoesettings`, toggle scheduling, use `/shoetiming` for a randomized 5-minute
-to 24-hour range and UTC quiet hours, and use `/shoelog` to choose the required
-private audit channel. `/forceshoe` posts immediately to the one channel chosen
+the Schedule tab in `/shoesettings`, toggle scheduling, edit the randomized
+5-minute to 24-hour range and UTC quiet hours in the Timing tab, and choose the
+required private audit channel in Logs. The dedicated `/shoetiming` and
+`/shoelog` commands remain available as shortcuts. `/forceshoe` posts immediately to the one channel chosen
 for that command, even when scheduled posts are off or unconfigured, without
 resetting the timer. `/shoestatus` reports database, image, timing, quiet-hours,
 destination, and audit-log health.
@@ -85,7 +86,23 @@ The reset control inside `/shoesettings` atomically deletes the server's total,
 current and best streaks, personal counts, Hall of Fame records, and Relay
 state. It preserves the configured channel and selected modes. The settings
 command, reset button, and separate confirmation all recheck the initiating
-user's Discord **Administrator** permission.
+user’s Discord **Administrator** permission.
+
+## Administrator control center
+
+`/shoesettings` opens a private, five-minute control center designed for both
+desktop and mobile Discord. Its header shows overall health and the next
+scheduled-post estimate. Five compact tabs keep only one task visible at a
+time:
+
+- **Game** changes the dedicated channel, matching mode, and gameplay mode.
+- **Schedule** manages multiple eligible destinations and the opt-in on/off state.
+- **Timing** edits the randomized delay and optional UTC quiet hours.
+- **Logs** selects the administrator audit channel and can send a test log.
+- **More** refreshes diagnostics and opens the separately confirmed data reset.
+
+The panel is bound to the administrator who opened it. Changes are validated
+against channel permissions before being saved.
 
 If `/forgetme` removes the last-contributor ID from an active Relay, that streak
 is completed and its aggregate length can enter the Hall of Fame. The result is
@@ -233,8 +250,8 @@ After connection:
 1. Run `/setup` as a server administrator.
 2. Select the dedicated channel, matching mode, and gameplay mode.
 3. Fix any missing permissions, recheck, and save.
-4. Open `/shoesettings`, select **Run diagnostic**, and send test messages in
-   the selected channel.
+4. Open `/shoesettings`, check the health summary, and use **More → Refresh
+   health** after fixing any missing permissions.
 
 ### Railway
 

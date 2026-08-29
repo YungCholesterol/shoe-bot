@@ -79,7 +79,7 @@ WAL checkpoint and truncation after user, reset, and server deletions.
 | Up to 10,000 recent Discord message IDs | Prevent duplicate processing during one process session | Until evicted from the bounded cache or process restart |
 | Discord guild/channel cache data, such as IDs, names, types, roles, and permissions | Maintain the Discord connection and evaluate channel access | Process lifetime; not copied to Shoe Bot's database |
 | Slash-command interaction data, including the invoker, permissions, locale, and selected user/channel options | Authorize and answer commands | Interaction-handler duration |
-| Setup/settings requester ID, server ID, selected channel/modes, interaction message reference, and associated interaction/webhook state | Keep an administrator wizard private and requester-bound | Up to 180 seconds |
+| Setup/settings requester ID, server ID, selected channel/modes, interaction message reference, and associated interaction/webhook state | Keep administrator setup and the settings control center private and requester-bound | Up to 300 seconds (the setup wizard may expire sooner) |
 | Reset requester ID, server ID, opaque in-memory token, interaction message reference, and associated interaction/webhook state | Prevent wrong-user, stale, or duplicate reset confirmation | Up to 30 seconds |
 
 This implementation configures discord.py's normal message cache and optional
