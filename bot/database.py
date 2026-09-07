@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 import sqlite3
 import threading
+import time
 from typing import Callable, Iterator, Literal, Sequence, TypeVar
 
 
@@ -70,6 +71,14 @@ class GuildStats:
 
 
 @dataclass(frozen=True, slots=True)
+class StreakRecap:
+    started_at: int | None
+    ended_at: int
+    contributors: int
+    contributors_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MessageUpdate:
     total_shoes: int
     current_streak: int
@@ -78,6 +87,7 @@ class MessageUpdate:
     accepted: bool
     break_reason: BreakReason | None
     hall_of_fame_rank: int | None
+    recap: StreakRecap | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +212,7 @@ class ShoeDatabase:
             user_version = int(
                 self._connection.execute("PRAGMA user_version").fetchone()[0]
             )
-            if user_version > 4:
+            if user_version > 5:
                 raise sqlite3.DatabaseError(
                     "Database schema is newer than this Shoe Bot release"
                 )
@@ -418,10 +428,35 @@ class ShoeDatabase:
                     "UPDATE guild_settings SET last_contributor_user_id = NULL"
                 )
 
+            # Only the active run needs contributor identities. Completing it
+            # deletes these rows; its public recap contains aggregate data only.
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_streaks (
+                    guild_id TEXT PRIMARY KEY NOT NULL,
+                    started_at INTEGER,
+                    contributors_complete INTEGER NOT NULL
+                        CHECK (contributors_complete IN (0, 1)),
+                    FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_streak_contributors (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, user_id),
+                    FOREIGN KEY (guild_id) REFERENCES active_streaks(guild_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID
+                """
+            )
             self._connection.execute(
                 """
                 INSERT INTO schema_metadata (metadata_key, metadata_value)
-                VALUES ('schema_version', '4')
+                VALUES ('schema_version', '5')
                 ON CONFLICT (metadata_key) DO UPDATE SET
                     metadata_value = excluded.metadata_value
                 """
@@ -433,7 +468,7 @@ class ShoeDatabase:
                 raise sqlite3.DatabaseError(
                     "Database foreign-key integrity check failed"
                 )
-            self._connection.execute("PRAGMA user_version = 4")
+            self._connection.execute("PRAGMA user_version = 5")
             self._connection.execute("COMMIT")
         except Exception:
             self._rollback_without_masking_error()
@@ -522,6 +557,7 @@ class ShoeDatabase:
         """
         if streak_length <= 0:
             return None
+        connection.execute("DELETE FROM active_streaks WHERE guild_id = ?", (guild,))
         existing = connection.execute(
             """
             SELECT 1 FROM hall_of_fame
@@ -877,8 +913,25 @@ class ShoeDatabase:
             accepted = bool(content_matches and not relay_repeat)
             break_reason: BreakReason | None = None
             hall_rank: int | None = None
+            recap: StreakRecap | None = None
 
             if accepted:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO active_streaks (
+                        guild_id, started_at, contributors_complete
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (guild, int(time.time()) if previous_streak == 0 else None,
+                     int(previous_streak == 0)),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO active_streak_contributors (guild_id, user_id)
+                    VALUES (?, ?)
+                    """,
+                    (guild, user),
+                )
                 next_contributor = user if gameplay_mode == "relay" else None
                 connection.execute(
                     """
@@ -912,6 +965,20 @@ class ShoeDatabase:
                     (guild,),
                 )
                 if previous_streak > 0:
+                    active = connection.execute(
+                        "SELECT started_at, contributors_complete FROM active_streaks WHERE guild_id = ?",
+                        (guild,),
+                    ).fetchone()
+                    contributors = connection.execute(
+                        "SELECT COUNT(*) FROM active_streak_contributors WHERE guild_id = ?",
+                        (guild,),
+                    ).fetchone()[0]
+                    recap = StreakRecap(
+                        started_at=active["started_at"] if active else None,
+                        ended_at=int(time.time()),
+                        contributors=int(contributors),
+                        contributors_complete=bool(active and active["contributors_complete"]),
+                    )
                     hall_rank = self._record_completed_streak(
                         connection, guild, previous_streak
                     )
@@ -933,7 +1000,26 @@ class ShoeDatabase:
             accepted=accepted,
             break_reason=break_reason,
             hall_of_fame_rank=hall_rank,
+            recap=recap,
         )
+
+    def get_rival_counts(
+        self, guild_id: int | str, user_id: int | str, rival_id: int | str,
+    ) -> tuple[int, int]:
+        """Read both lifetime counts from one consistent server snapshot."""
+        guild = self._snowflake(guild_id, "guild_id")
+        user = self._snowflake(user_id, "user_id")
+        rival = self._snowflake(rival_id, "rival_id")
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id, shoe_count FROM user_stats
+                WHERE guild_id = ? AND user_id IN (?, ?)
+                """,
+                (guild, user, rival),
+            ).fetchall()
+        counts = {str(row["user_id"]): int(row["shoe_count"]) for row in rows}
+        return counts.get(user, 0), counts.get(rival, 0)
 
     def get_user_stats(self, guild_id: int | str, user_id: int | str) -> UserStats:
         guild = self._snowflake(guild_id, "guild_id")
@@ -1058,6 +1144,7 @@ class ShoeDatabase:
                 raise GuildNotConfigured("This server has not configured Shoe Bot")
             connection.execute("DELETE FROM user_stats WHERE guild_id = ?", (guild,))
             connection.execute("DELETE FROM hall_of_fame WHERE guild_id = ?", (guild,))
+            connection.execute("DELETE FROM active_streaks WHERE guild_id = ?", (guild,))
         self._checkpoint_after_deletion()
 
     def delete_user_stats(self, guild_id: int | str, user_id: int | str) -> UserDeletion:
@@ -1091,6 +1178,15 @@ class ShoeDatabase:
                     SET current_streak = 0, last_contributor_user_id = NULL
                     WHERE guild_id = ?
                     """,
+                    (guild,),
+                )
+            removed_contributor = connection.execute(
+                "DELETE FROM active_streak_contributors WHERE guild_id = ? AND user_id = ?",
+                (guild, user),
+            )
+            if removed_contributor.rowcount:
+                connection.execute(
+                    "UPDATE active_streaks SET contributors_complete = 0 WHERE guild_id = ?",
                     (guild,),
                 )
             cursor = connection.execute(

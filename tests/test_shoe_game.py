@@ -20,7 +20,7 @@ class FakeChannel:
         self.fail_send = fail_send
         self.sent: list[tuple[str, dict]] = []
 
-    async def send(self, text: str, **kwargs) -> None:
+    async def send(self, text: str | None = None, **kwargs) -> None:
         if self.fail_send:
             raise discord.Forbidden(
                 SimpleNamespace(status=403, reason="Forbidden"),
@@ -190,7 +190,7 @@ class ShoeGameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.database.get_guild_stats(100).total_shoes, 1)
         self.assertEqual(len(channel.sent), 1)
         self.assertEqual(
-            channel.sent[0][0],
+            channel.sent[0][1]["embed"].description,
             "<@300> broke a 1-message shoe streak by posting twice in a row. "
             "It entered the Hall of Fame at rank #1.",
         )
@@ -208,7 +208,7 @@ class ShoeGameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[2].reactions, ["❌"])
         self.assertEqual(len(channel.sent), 1)
         self.assertEqual(
-            channel.sent[0][0],
+            channel.sent[0][1]["embed"].description,
             "<@300> broke a 1-message shoe streak. "
             "It entered the Hall of Fame at rank #1.",
         )

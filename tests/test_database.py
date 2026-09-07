@@ -511,6 +511,8 @@ class ShoeDatabaseTests(unittest.TestCase):
         connection.executescript(
             """
             PRAGMA foreign_keys = OFF;
+            DROP TABLE IF EXISTS active_streak_contributors;
+            DROP TABLE IF EXISTS active_streaks;
             DROP TABLE IF EXISTS hall_of_fame;
             DROP TABLE IF EXISTS user_stats;
             DROP TABLE IF EXISTS schema_metadata;

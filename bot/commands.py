@@ -18,7 +18,7 @@ from .database import (
     LeaderboardEntry,
     ShoeDatabase,
 )
-from .shoe_game import FOOTWEAR_EMOJIS, ShoeGame
+from .shoe_game import FOOTWEAR_EMOJIS, ShoeGame, message_matches_shoe
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1833,6 +1833,70 @@ class ShoeCommands(commands.Cog):
             f"Sent `Shoe` with the image in {channel.mention}. The automatic timer was not changed.",
         )
 
+    @app_commands.command(
+        name="shoecheck", description="Privately test text or emoji without risking the streak"
+    )
+    @app_commands.describe(text="Text or emoji to test against this server's matching rules")
+    @app_commands.guild_only()
+    async def shoecheck(
+        self, interaction: discord.Interaction, text: app_commands.Range[str, 1, 2000],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        stats = await self._guild_stats_or_error(interaction)
+        if stats is None:
+            return
+        matches = message_matches_shoe(text, stats.matching_mode)
+        matching, gameplay = _rules_text(stats)
+        embed = discord.Embed(
+            title="Shoe check: match" if matches else "Shoe check: no match",
+            description=(
+                "Your text matches this server's Shoe rules."
+                if matches else "Your text does not match this server's Shoe rules."
+            ),
+            colour=discord.Colour.green() if matches else discord.Colour.orange(),
+        )
+        embed.add_field(name=f"{stats.matching_mode.title()} matching", value=matching, inline=False)
+        embed.add_field(name=f"{stats.gameplay_mode.title()} gameplay", value=gameplay, inline=False)
+        embed.set_footer(
+            text="Private text/emoji test only. No counts changed. Live channel and Relay rules still apply."
+        )
+        # Do not echo or persist the supplied text, including mentions or links.
+        await _respond(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="rival", description="Compare your Shoe count with another server member")
+    @app_commands.describe(user="The server member you want to compare with")
+    @app_commands.guild_only()
+    async def rival(self, interaction: discord.Interaction, user: discord.Member) -> None:
+        if user.id == interaction.user.id:
+            await _private_error(interaction, "Pick someone else. You are already tied with yourself.")
+            return
+        if user.bot:
+            await _private_error(interaction, "Pick a human rival. Bots do not earn Shoe counts.")
+            return
+        await interaction.response.defer(thinking=True)
+        if await self._guild_stats_or_error(interaction) is None:
+            return
+        try:
+            yours, theirs = await self._database.run(
+                self._database.get_rival_counts, interaction.guild_id, interaction.user.id, user.id,
+            )
+        except DatabaseError as exc:
+            LOGGER.error("Could not compare Shoe counts (%s)", type(exc).__name__)
+            await _private_error(interaction, "The rivalry board is temporarily unavailable.")
+            return
+        gap = abs(yours - theirs)
+        if yours == theirs:
+            status = "You are tied. The next accepted shoe takes the lead."
+        elif yours > theirs:
+            status = f"You lead by **{gap:,}** shoes. Your rival needs **{gap + 1:,}** to pass you."
+        else:
+            status = f"You trail by **{gap:,}** shoes. **{gap:,}** to tie, **{gap + 1:,}** to take the lead."
+        embed = discord.Embed(title="Shoe rivalry", description=status, colour=EMBED_COLOUR)
+        embed.add_field(name="You", value=f"{interaction.user.mention}\n**{yours:,}** shoes")
+        embed.add_field(name="Your rival", value=f"{user.mention}\n**{theirs:,}** shoes")
+        embed.set_footer(text="Lifetime accepted counts in this server. A comparison only; no rivalry is saved.")
+        await _respond(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
     @app_commands.command(name="streak", description="Show this server's Shoe streak")
     @app_commands.guild_only()
     async def streak(self, interaction: discord.Interaction) -> None:
@@ -1978,7 +2042,8 @@ class ShoeCommands(commands.Cog):
             name="Game commands",
             value=(
                 "`/streak` · `/profile [user]` · `/leaderboard` · "
-                "`/shoehelp` · `/forgetme`"
+                "`/shoecheck text:...` · `/rival user:@member` · `/shoehelp` · `/forgetme`\n"
+                "Test matching privately with `/shoecheck`, or compare server counts with `/rival`."
             ),
             inline=False,
         )
@@ -1992,7 +2057,9 @@ class ShoeCommands(commands.Cog):
             value=(
                 "One Discord message can add at most one count. Invalid messages "
                 "break non-zero streaks. Bots, webhooks, Discord system notices, "
-                "edits, and deletions are ignored; ordinary replies count."
+                "edits, and deletions are ignored; ordinary replies count. "
+                "A broken non-zero streak gets a recap with its length, time alive, "
+                "contributors, and distance from the server best."
             ),
             inline=False,
         )

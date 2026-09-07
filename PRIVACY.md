@@ -1,6 +1,6 @@
 # Shoe Bot Privacy Policy
 
-Effective date: August 25, 2026
+Effective date: September 7, 2026
 
 Shoe Bot is operated by **Yung Cholesterol**. Privacy questions and data
 requests may be sent to
@@ -57,12 +57,16 @@ therefore never retroactively change counters.
 | Global total, current streak, and best streak | Provide server statistics | Until the reset control in `/shoesettings` is confirmed or the bot is removed |
 | Discord user ID and accepted-message count | Personal statistics, milestones, and leaderboard ranking | Until `/forgetme`, a confirmed server reset, or removal |
 | Last accepted contributor's Discord user ID in an active Relay | Enforce different consecutive contributors across messages and restarts | Until the streak ends, relevant settings change, `/forgetme`, a confirmed server reset, or removal |
+| Active streak start time and contributor-completeness flag | Calculate time alive and accurately label incomplete recap data across restarts | Until the streak ends, relevant settings change, a confirmed server reset, or removal |
+| Distinct accepted contributor IDs for the active streak | Count distinct participants for an aggregate streak recap | Until the streak ends, relevant settings change, that user's `/forgetme`, a confirmed server reset, or removal |
 | Completed streak length, completion time, and legacy-record flag | Maintain an aggregate top-10 Hall of Fame | Until pruned from the top 10, a confirmed server reset, or removal |
 
 Hall of Fame rows contain no contributor or breaker ID. Milestones are
 calculated from the stored personal count and do not require a separate
 milestone profile. A legacy Hall of Fame record has no exact completion time
 because it was migrated from the best streak stored by an earlier release.
+Completed recaps do not create new historical contributor records in SQLite.
+`/rival` reads existing server counts without storing a rivalry or a new score.
 
 SQLite may use associated WAL and shared-memory files containing the same
 database records. The application enables SQLite secure deletion and attempts a
@@ -79,6 +83,7 @@ WAL checkpoint and truncation after user, reset, and server deletions.
 | Up to 10,000 recent Discord message IDs | Prevent duplicate processing during one process session | Until evicted from the bounded cache or process restart |
 | Discord guild/channel cache data, such as IDs, names, types, roles, and permissions | Maintain the Discord connection and evaluate channel access | Process lifetime; not copied to Shoe Bot's database |
 | Slash-command interaction data, including the invoker, permissions, locale, and selected user/channel options | Authorize and answer commands | Interaction-handler duration |
+| Text or emoji submitted to `/shoecheck` | Privately test the current matching rules | Interaction-handler duration; not echoed in the response, logged, or saved in SQLite |
 | Setup/settings requester ID, server ID, selected channel/modes, interaction message reference, and associated interaction/webhook state | Keep administrator setup and the settings control center private and requester-bound | Up to 300 seconds (the setup wizard may expire sooner) |
 | Reset requester ID, server ID, opaque in-memory token, interaction message reference, and associated interaction/webhook state | Prevent wrong-user, stale, or duplicate reset confirmation | Up to 30 seconds |
 
@@ -111,7 +116,14 @@ Game responses share limited information with members who can use commands or
 see the configured channel. Public statistics, leaderboard, and profile
 responses may turn a stored Discord user ID into a Discord mention and show its
 count, rank, or derived milestones. A streak-break message shows the breaker's
-Discord mention and the aggregate streak length that ended. Hall of Fame and
+Discord mention and an aggregate recap of the run: length, duration, number of
+contributors (labeled partial when necessary), active modes, and distance from
+the server best. It does not list the contributors or ping members. Recaps are
+Discord messages visible in the game channel; deleting data from Shoe Bot's
+database does not remove previously posted Discord messages. `/rival` shows
+the caller's and selected member's existing counts without pinging either
+person or saving their relationship. `/shoecheck` replies privately and does
+not change game statistics. Hall of Fame and
 server-stat responses show aggregate counts without contributor identities.
 Discord controls who can see each channel and interaction response.
 
@@ -189,7 +201,9 @@ policy violation to Discord or another required authority.
 - `/leaderboard` displays the top contributors and provides a Hall of Fame view
   containing aggregate completed-streak records.
 - `/forgetme` deletes the caller's Discord user ID and personal count in that
-  server. Aggregate total and best-streak values remain and may no longer equal
+  server, including their active-streak contributor entry. If a run continues,
+  its contributor count is marked partial without publicly explaining why.
+  Aggregate total and best-streak values remain and may no longer equal
   the sum of visible leaderboard rows. If the caller is the last contributor to
   an active Relay, the current streak is ended so the bot no longer retains
   their user ID as Relay state. The completed aggregate streak length may enter
@@ -202,7 +216,7 @@ policy violation to Discord or another required authority.
   Saving identical settings leaves the active streak unchanged.
 - The reset control inside `/shoesettings` lets a current server Administrator
   delete all of that server's counts, streaks, user rows, Hall of Fame rows, and
-  Relay state after a private, requester-bound confirmation. The selected
+  Relay and active recap state after a private, requester-bound confirmation. The selected
   channel and modes remain.
 - Removing Shoe Bot from a server deletes that server's live configuration and
   game data. Startup reconciliation handles a removal that occurred while the

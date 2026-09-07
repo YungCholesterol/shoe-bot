@@ -124,6 +124,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                 "profile",
                 "leaderboard",
                 "shoehelp",
+                "shoecheck",
+                "rival",
                 "forgetme",
                 "shoelog",
                 "shoetiming",
