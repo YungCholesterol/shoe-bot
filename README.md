@@ -55,6 +55,8 @@ leaves the active streak unchanged.
 | --- | --- | --- |
 | `/streak` | Everyone | Show the current streak, best streak, total count, and active modes. |
 | `/profile [user]` | Everyone | Show a user's accepted count, rank, and milestones; defaults to the caller. |
+| `/shoecheck text:...` | Everyone | Privately test text or emoji against the current matching mode without affecting counts or the streak. |
+| `/rival user:@member` | Everyone | Compare your lifetime accepted count with another human member in this server, including the gap and count needed to take the lead. |
 | `/leaderboard` | Everyone | Show the top 10 contributors and switch to the Hall of Fame. |
 | `/shoehelp` | Everyone | Show active rules, or recommended defaults before setup, plus commands, policies, and support. |
 | `/forgetme` | Everyone | Delete the caller's stored user ID and personal count. |
@@ -64,6 +66,35 @@ leaves the active streak unchanged.
 | `/shoetiming` | Administrator | Configure randomized timing and UTC quiet hours. |
 | `/shoestatus` | Everyone | Report bot and Random Shoe configuration health. |
 | `/forceshoe channel:#channel` | Administrator | Immediately send one Shoe post to exactly the selected channel without changing the timer. |
+
+## Streak recap cards and player commands
+
+Whenever a message breaks a non-zero streak, the bot replaces the old break
+announcement with one compact recap card: final streak length, time alive,
+distinct contributors, distance from the server best, active modes, and the
+existing Hall of Fame result. Recaps do not ping members. If the bot cannot
+send embeds, it attempts a text recap with the same information. Granting
+**Embed Links** in the game channel enables the card presentation; it is optional.
+Settings changes, resets, and privacy requests do not post public recap cards.
+
+Time alive runs from the first accepted message until the breaking message is
+processed, including idle time. Start time and active contributor IDs survive
+restarts. Those temporary records are deleted when the run ends. A streak
+already active when this feature is installed keeps its count, but its start
+time is unavailable and its contributor count may be partial. Partial counts
+are labeled; historical details are never invented.
+
+`/shoecheck text:sh0e` tests the same matcher as live play and replies privately.
+It tests supplied text and emoji, including custom-emoji text; it does not test
+attached stickers or images. It never increments or breaks a streak. A match
+is not a reservation of your turn: the configured channel and Relay rules
+still apply when you actually post.
+
+`/rival user:@member` shows your two existing lifetime server counts and how
+many accepted shoes separate you. Ties, new players with zero counts, and
+members without stored statistics are supported. Self-comparisons and bot
+targets are rejected privately. The comparison does not ping the selected
+member, save a rivalry, create a separate score, or change either player's data.
 
 ## Random Shoe posts
 
@@ -83,8 +114,8 @@ channel every post goes there. The original image is stored and sent without
 resizing or recompression.
 
 The reset control inside `/shoesettings` atomically deletes the server's total,
-current and best streaks, personal counts, Hall of Fame records, and Relay
-state. It preserves the configured channel and selected modes. The settings
+current and best streaks, personal counts, Hall of Fame records, Relay state,
+and active recap data. It preserves the configured channel and selected modes. The settings
 command, reset button, and separate confirmation all recheck the initiating
 user’s Discord **Administrator** permission.
 
@@ -271,7 +302,8 @@ that customer databases are encrypted at rest in its
 
 SQLite stores only the data described in [PRIVACY.md](PRIVACY.md): Discord
 server, channel, and user IDs; selected modes; counters; the active Relay
-contributor ID; and aggregate Hall of Fame lengths and timestamps. It does not
+contributor ID; the active streak's start time, contributor IDs, and completeness
+flag; and aggregate Hall of Fame lengths and timestamps. It does not
 store message text, usernames, attachments, or analyzed sticker/custom-emoji
 names.
 
@@ -314,7 +346,9 @@ The suite covers matching, system-message filtering, Relay and settings races,
 ordered worker cancellation and shutdown, transaction and migration rollback,
 persistence, Hall of Fame pruning, rankings, deletion/reset ordering,
 administrator component authorization, duplicate clicks, post-commit response
-failures, least-privilege intents, and runtime deduplication.
+failures, least-privilege intents, and runtime deduplication. Player-update tests
+cover private matching checks, rivalry comparisons, recap persistence and
+cleanup, schema upgrades, and recap delivery without embed permissions.
 
 ## Creator
 

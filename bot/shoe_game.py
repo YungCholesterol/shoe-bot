@@ -16,6 +16,7 @@ from .database import (
     DatabaseError,
     GuildConfig,
     MatchingMode,
+    MessageUpdate,
     ShoeDatabase,
     UserDeletion,
 )
@@ -89,6 +90,47 @@ def message_matches_shoe(
     if _creative_text_match(content):
         return True
     return any(_creative_text_match(name) for name in sticker_names)
+
+
+def _duration_text(seconds: int) -> str:
+    seconds = max(0, seconds)
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days:,}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
+def streak_recap_embed(update: MessageUpdate, config: GuildConfig, summary: str) -> discord.Embed:
+    """Build a compact recap from the committed transition, never a later query."""
+    embed = discord.Embed(
+        title="Shoe streak recap", description=summary,
+        colour=discord.Colour.from_rgb(43, 45, 49),
+    )
+    embed.add_field(name="Final streak", value=f"**{update.previous_streak:,}** shoes")
+    recap = update.recap
+    duration = (
+        _duration_text(recap.ended_at - recap.started_at)
+        if recap is not None and recap.started_at is not None else "Unavailable for this run"
+    )
+    contributors = (
+        f"{recap.contributors:,}" if recap is not None and recap.contributors_complete
+        else f"{recap.contributors:,} recorded (partial)" if recap is not None and recap.contributors
+        else "Unavailable for this run"
+    )
+    embed.add_field(name="Time alive", value=duration)
+    embed.add_field(name="Contributors", value=contributors)
+    gap = update.best_streak - update.previous_streak
+    record = (
+        f"Matched the server best: **{update.best_streak:,}**."
+        if gap == 0 else f"**{gap:,}** short of the server best (**{update.best_streak:,}**)."
+    )
+    embed.add_field(name="Record chase", value=record, inline=False)
+    embed.set_footer(text=f"{config.matching_mode.title()} matching · {config.gameplay_mode.title()} gameplay · Run it back.")
+    return embed
 
 
 class RecentMessageCache:
@@ -324,16 +366,21 @@ class ShoeGame:
                 f"#{update.hall_of_fame_rank:,}."
             )
 
+        embed = streak_recap_embed(update, config, text)
         try:
-            await message.channel.send(
-                text,
-                allowed_mentions=discord.AllowedMentions(
-                    users=[message.author],
-                    roles=False,
-                    everyone=False,
-                    replied_user=False,
-                ),
-            )
+            try:
+                await message.channel.send(
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                # Existing installations only require the original four channel
+                # permissions. A readable recap still works without Embed Links.
+                fallback = text + "\n" + "\n".join(
+                    f"**{field.name}:** {field.value}" for field in embed.fields
+                ) + f"\n{embed.footer.text}"
+                await message.channel.send(
+                    fallback, allowed_mentions=discord.AllowedMentions.none(),
+                )
         except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
             LOGGER.warning(
                 "Could not send the streak-break message (%s)", type(exc).__name__
