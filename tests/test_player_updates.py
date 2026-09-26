@@ -63,7 +63,7 @@ class RecapDatabaseTests(unittest.TestCase):
         connection.close()
         self.db = ShoeDatabase(self.path)
         self.assertEqual(self.db.get_guild_stats(100).current_streak, 1)
-        self.assertEqual(self.db._connection.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(self.db._connection.execute("PRAGMA user_version").fetchone()[0], 6)
         self.db.record_message(100, 301, True)
         update = self.db.record_message(100, None, False)
         self.assertEqual(update.previous_streak, 2)

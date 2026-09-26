@@ -1,6 +1,6 @@
 # Shoe Bot Privacy Policy
 
-Effective date: September 7, 2026
+Effective date: September 26, 2026
 
 Shoe Bot is operated by **Yung Cholesterol**. Privacy questions and data
 requests may be sent to
@@ -52,6 +52,7 @@ therefore never retroactively change counters.
 | Data | Purpose | Retention |
 | --- | --- | --- |
 | Discord server ID and configured channel ID | Keep each server's game separate and route new events | Until the bot is removed from the server |
+| Discord server ID and welcome-attempt flag, including servers without game setup | Send a setup welcome without duplicate messages after reconnects or restarts | Until the bot is removed; removals while offline are reconciled after reconnecting |
 | Matching mode and gameplay mode | Apply that server's selected rules | Until changed or the bot is removed |
 | Random Shoe enabled state, destination and audit-log channel IDs, timing range, UTC quiet hours, and next scheduled time | Deliver and audit optional administrator-configured Random Shoe posts and resume timing after restarts | Until changed or the bot is removed |
 | Global total, current streak, and best streak | Provide server statistics | Until the reset control in `/shoesettings` is confirmed or the bot is removed |

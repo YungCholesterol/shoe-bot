@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from .commands import ShoeCommands, _private_error
 from .database import DatabaseError, ShoeDatabase
+from .onboarding import WelcomeService, WelcomeView
 from .shoe_game import ShoeGame
 
 
@@ -98,6 +99,9 @@ class ShoeBot(commands.Bot):
         self.tree.on_error = self.on_app_command_error
         self._random_shoe_task: asyncio.Task[None] | None = None
         self._guild_commands_cleaned = False
+        self._welcomes: WelcomeService | None = None
+        self._welcome_history_ready = False
+        self._welcome_existing = os.getenv("SHOE_WELCOME_EXISTING", "") == "1"
 
     @staticmethod
     def _next_random_shoe_at(min_minutes: int = 50, max_minutes: int = 103) -> int:
@@ -165,7 +169,11 @@ class ShoeBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.game.load_configuration()
-        await self.add_cog(ShoeCommands(self.database, self.game))
+        shoe_commands = ShoeCommands(self.database, self.game)
+        await self.add_cog(shoe_commands)
+        welcome_view = WelcomeView(shoe_commands.open_setup)
+        self.add_view(welcome_view)
+        self._welcomes = WelcomeService(self.database, welcome_view)
         self._random_shoe_task = asyncio.create_task(
             self._random_shoe_loop(), name="random-shoe-scheduler"
         )
@@ -215,6 +223,18 @@ class ShoeBot(commands.Bot):
                     "Could not purge stale server data (%s)", type(exc).__name__
                 )
         LOGGER.info("Shoe Bot is ready in %d server(s)", len(self.guilds))
+        if self._welcomes is not None:
+            self._welcome_history_ready = await self._welcomes.reconcile(
+                list(self.guilds), include_existing=self._welcome_existing,
+            )
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        if self._welcomes is not None:
+            await self._welcomes.send(guild)
+
+    async def on_guild_available(self, guild: discord.Guild) -> None:
+        if self._welcome_history_ready and self._welcomes is not None:
+            await self._welcomes.send(guild, include_existing=self._welcome_existing)
 
     async def on_message(self, message: discord.Message) -> None:
         # Prefix commands are intentionally unsupported; only slash commands are used.

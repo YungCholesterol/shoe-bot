@@ -51,6 +51,22 @@ leaves the active streak unchanged.
 
 ## Commands
 
+When Shoe Bot joins a new server, it sends one setup welcome in the server's
+system channel, or another text channel where it can view and send messages.
+The **Set up Shoe Bot** button opens the existing private setup wizard for a
+server administrator. The button survives restarts; `/setup` and `/shoehelp`
+also remain available. The welcome does not ping anyone or send DMs.
+
+Welcome attempts are saved before delivery to prevent duplicate messages after
+reconnects or power outages. If no channel allows delivery, or delivery is
+uncertain, the bot logs the outcome and does not repeatedly message the server.
+It does not send timed reminders. Removing the bot clears its welcome history.
+
+On first deployment, already-installed servers are excluded from automatic
+welcomes. The operator can explicitly enable a one-time catch-up for servers
+without setup by setting `SHOE_WELCOME_EXISTING=1` for a launch. Saved attempt
+history prevents repeat catch-up messages; configured servers are skipped.
+
 | Command | Access | Result |
 | --- | --- | --- |
 | `/streak` | Everyone | Show the current streak, best streak, total count, and active modes. |

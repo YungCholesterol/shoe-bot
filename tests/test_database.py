@@ -519,6 +519,7 @@ class ShoeDatabaseTests(unittest.TestCase):
             DROP TABLE IF EXISTS guild_settings;
             DROP TABLE IF EXISTS random_shoe_channels;
             DROP TABLE IF EXISTS random_shoe_settings;
+            DROP TABLE IF EXISTS guild_welcomes;
             PRAGMA user_version = 2;
             """
         )

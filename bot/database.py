@@ -212,7 +212,7 @@ class ShoeDatabase:
             user_version = int(
                 self._connection.execute("PRAGMA user_version").fetchone()[0]
             )
-            if user_version > 5:
+            if user_version > 6:
                 raise sqlite3.DatabaseError(
                     "Database schema is newer than this Shoe Bot release"
                 )
@@ -455,8 +455,16 @@ class ShoeDatabase:
             )
             self._connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS guild_welcomes (
+                    guild_id TEXT PRIMARY KEY NOT NULL,
+                    attempted INTEGER NOT NULL CHECK (attempted IN (0, 1))
+                ) WITHOUT ROWID
+                """
+            )
+            self._connection.execute(
+                """
                 INSERT INTO schema_metadata (metadata_key, metadata_value)
-                VALUES ('schema_version', '5')
+                VALUES ('schema_version', '6')
                 ON CONFLICT (metadata_key) DO UPDATE SET
                     metadata_value = excluded.metadata_value
                 """
@@ -468,7 +476,7 @@ class ShoeDatabase:
                 raise sqlite3.DatabaseError(
                     "Database foreign-key integrity check failed"
                 )
-            self._connection.execute("PRAGMA user_version = 5")
+            self._connection.execute("PRAGMA user_version = 6")
             self._connection.execute("COMMIT")
         except Exception:
             self._rollback_without_masking_error()
@@ -1196,10 +1204,56 @@ class ShoeDatabase:
         self._checkpoint_after_deletion()
         return UserDeletion(cursor.rowcount > 0, ended_streak)
 
+    def prepare_welcomes(self, guild_ids: Sequence[int]) -> None:
+        """Baseline existing installs on first deployment; prune departed servers."""
+        guilds = {self._snowflake(guild, "guild_id") for guild in guild_ids}
+        with self._write_transaction() as connection:
+            initialized = connection.execute(
+                "SELECT 1 FROM schema_metadata WHERE metadata_key = 'welcomes_initialized'"
+            ).fetchone()
+            if initialized is None:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO guild_welcomes VALUES (?, 0)",
+                    [(guild,) for guild in guilds],
+                )
+                connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('welcomes_initialized', '1')"
+                )
+            stale = [
+                (row[0],) for row in connection.execute("SELECT guild_id FROM guild_welcomes")
+                if row[0] not in guilds
+            ]
+            connection.executemany("DELETE FROM guild_welcomes WHERE guild_id = ?", stale)
+        if stale:
+            self._checkpoint_after_deletion()
+
+    def claim_welcome(self, guild_id: int, include_existing: bool = False) -> bool:
+        """Claim before network I/O so concurrent events/restarts cannot spam."""
+        guild = self._snowflake(guild_id, "guild_id")
+        with self._write_transaction() as connection:
+            configured = connection.execute(
+                "SELECT 1 FROM guild_settings WHERE guild_id = ?", (guild,)
+            ).fetchone()
+            if configured is not None:
+                connection.execute("INSERT OR IGNORE INTO guild_welcomes VALUES (?, 1)", (guild,))
+                return False
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO guild_welcomes VALUES (?, 1)", (guild,)
+            ).rowcount
+            if inserted:
+                return True
+            if include_existing:
+                return bool(connection.execute(
+                    "UPDATE guild_welcomes SET attempted = 1 WHERE guild_id = ? AND attempted = 0",
+                    (guild,),
+                ).rowcount)
+            return False
+
     def delete_guild(self, guild_id: int | str) -> None:
         guild = self._snowflake(guild_id, "guild_id")
         with self._write_transaction() as connection:
             connection.execute("DELETE FROM guild_settings WHERE guild_id = ?", (guild,))
+            connection.execute("DELETE FROM guild_welcomes WHERE guild_id = ?", (guild,))
         self._checkpoint_after_deletion()
 
     def _close_connection(self) -> None:

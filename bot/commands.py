@@ -1682,6 +1682,17 @@ class ShoeCommands(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
     async def setup(self, interaction: discord.Interaction) -> None:
+        await self.open_setup(interaction)
+
+    async def open_setup(self, interaction: discord.Interaction) -> None:
+        """Shared entry point; buttons must enforce the slash command's checks too."""
+        if interaction.guild is None or interaction.guild_id is None:
+            await _private_error(interaction, "Run `/setup` inside your server.")
+            return
+        permissions = getattr(interaction.user, "guild_permissions", discord.Permissions.none())
+        if not permissions.administrator:
+            await _private_error(interaction, "A server administrator needs to set up Shoe Bot.")
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         stats = None
         if interaction.guild_id is not None:
